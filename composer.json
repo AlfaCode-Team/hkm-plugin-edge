@@ -3,13 +3,21 @@
     "description": "HKM Kernel plugin providing 'edge.routing'.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["hkm-kernel", "plugin", "php", "edge.routing"],
+    "keywords": [
+        "hkm-kernel",
+        "plugin",
+        "php",
+        "edge.routing"
+    ],
     "require": {
         "php": ">=8.4"
     },
     "autoload": {
         "psr-4": {
             "Plugins\\Edge\\": ""
-        }
+        },
+        "files": [
+            "Support/helpers.php"
+        ]
     }
 }
