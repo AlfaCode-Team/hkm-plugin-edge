@@ -184,14 +184,101 @@ final class SystemProbe
         return preg_match('/php(\d+\.\d+)-fpm\.sock$/', $path, $m) ? $m[1] : '0';
     }
 
-    /** Run an arbitrary command; returns [exitCode, combinedOutput]. */
+    /**
+     * Binaries this probe is permitted to invoke.
+     *
+     * The commands come from configuration (EDGE_* env), and the reload path
+     * typically runs as ROOT. Env is a weaker trust boundary than code — a
+     * compromised .env, a bad deploy template or an operator typo previously
+     * meant arbitrary root command execution, because the whole string went to
+     * exec() with full shell interpretation.
+     *
+     * Extend with EDGE_ALLOWED_BINARIES (comma-separated) rather than editing
+     * this list, so a distro-specific binary needs no code change.
+     */
+    private const ALLOWED_BINARIES = [
+        'nginx', 'apache2ctl', 'apachectl', 'httpd',
+        'systemctl', 'service', 'rc-service', 'brew',
+        'command', 'test', 'true',
+    ];
+
+    /**
+     * Run a command; returns [exitCode, combinedOutput].
+     *
+     * The command still runs through a shell — `which()` depends on the
+     * `command -v` builtin, and the configured reload strings legitimately use
+     * `sudo` — but the EFFECTIVE binary is checked against an allow-list first,
+     * so a hostile configuration value cannot turn this into arbitrary root
+     * execution.
+     */
     public function run(string $command): array
     {
+        $binary = self::effectiveBinary($command);
+
+        if ($binary === null || !self::isAllowedBinary($binary)) {
+            return [
+                126, // shell convention: found but not executable/permitted
+                sprintf(
+                    'Refusing to run [%s]: %s is not an allowed binary. '
+                    . 'Add it to EDGE_ALLOWED_BINARIES if this is intended.',
+                    $command,
+                    $binary ?? '(none)',
+                ),
+            ];
+        }
+
         $output = [];
         $code   = 0;
         @exec($command . ' 2>&1', $output, $code);
 
         return [$code, implode("\n", $output)];
+    }
+
+    /**
+     * The binary a command will actually invoke, skipping a leading `sudo` and
+     * any of its flags, and reducing an absolute path to its basename.
+     *
+     * Also rejects a command containing shell metacharacters that would let a
+     * second command ride along ( ; | & ` $( ), since only the FIRST binary is
+     * being validated.
+     */
+    private static function effectiveBinary(string $command): ?string
+    {
+        $command = trim($command);
+
+        if ($command === '' || preg_match('/[;&|`]|\$\(/', $command) === 1) {
+            return null;
+        }
+
+        $tokens = preg_split('/\s+/', $command) ?: [];
+
+        foreach ($tokens as $token) {
+            if ($token === 'sudo' || str_starts_with($token, '-')) {
+                continue; // sudo itself, and its flags, are not the target
+            }
+            if (str_contains($token, '=')) {
+                continue; // FOO=bar prefix assignment
+            }
+
+            return basename($token);
+        }
+
+        return null;
+    }
+
+    private static function isAllowedBinary(string $binary): bool
+    {
+        $extra = \function_exists('env') ? (string) (env('EDGE_ALLOWED_BINARIES') ?? '') : '';
+
+        $allowed = self::ALLOWED_BINARIES;
+        foreach (explode(',', $extra) as $name) {
+            $name = trim($name);
+            if ($name !== '') {
+                $allowed[] = $name;
+            }
+        }
+
+        return \in_array($binary, $allowed, true);
     }
 
     private function which(string $binary): bool

@@ -206,9 +206,25 @@ final class EdgeService implements EdgeServiceContract
         if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
             return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Cannot create directory {$dir}"];
         }
+        // Back up the CURRENT good config before overwriting it. The new file
+        // is written over the live path and only then validated, so without a
+        // backup a failed `nginx -t` left the broken config in place — and the
+        // next reload, by anyone (a deploy, logrotate, a reboot), would load it.
+        // The failure would surface later and somewhere else.
+        $backup = null;
+        if (is_file($plan->targetPath)) {
+            $backup = $plan->targetPath . '.bak-' . bin2hex(random_bytes(4));
+            if (!@copy($plan->targetPath, $backup)) {
+                return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Cannot back up {$plan->targetPath} — refusing to overwrite it"];
+            }
+        }
+
         $tmp = $plan->targetPath . '.tmp';
         if (@file_put_contents($tmp, $plan->contents) === false || !@rename($tmp, $plan->targetPath)) {
             @unlink($tmp);
+            if ($backup !== null) {
+                @unlink($backup);
+            }
             return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Failed to write {$plan->targetPath}"];
         }
 
@@ -237,7 +253,22 @@ final class EdgeService implements EdgeServiceContract
             [$tc, $tout] = $this->probe->run($testCmd);
             $steps[] = "test: {$testCmd} → " . ($tc === 0 ? 'ok' : 'FAILED');
             if ($tc !== 0) {
+                // ROLL BACK. Leaving an invalid config at the live path turns a
+                // caught, reported failure into an outage the next time anything
+                // reloads the server.
+                if ($backup !== null && @rename($backup, $plan->targetPath)) {
+                    $steps[] = "rolled back {$plan->targetPath} to the previous config";
+                } elseif ($backup !== null) {
+                    $steps[] = "WARNING: could not restore {$plan->targetPath} from {$backup} — restore it manually before reloading";
+                }
+
                 return ['ok' => false, 'strategy' => $plan->strategy->value, 'path' => $plan->targetPath, 'steps' => $steps, 'hosts' => $hosts, 'message' => trim($tout)];
+            }
+
+            // Validated: the backup has done its job.
+            if ($backup !== null) {
+                @unlink($backup);
+                $backup = null;
             }
 
             [$rc, $rout] = $this->probe->run($reloadCmd);
@@ -245,6 +276,13 @@ final class EdgeService implements EdgeServiceContract
             if ($rc !== 0) {
                 return ['ok' => false, 'strategy' => $plan->strategy->value, 'path' => $plan->targetPath, 'steps' => $steps, 'hosts' => $hosts, 'message' => trim($rout)];
             }
+        }
+
+        // Nothing validated the write (reload was skipped), or it validated and
+        // the backup was already removed. Either way do not leave a stale
+        // .bak-* beside the live config.
+        if ($backup !== null) {
+            @unlink($backup);
         }
 
         return [
