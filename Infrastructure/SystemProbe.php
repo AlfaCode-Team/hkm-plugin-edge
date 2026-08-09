@@ -14,18 +14,32 @@ use Plugins\Edge\Domain\ServerStack;
  */
 final class SystemProbe
 {
-    /** Probe the host and build an immutable ServerStack snapshot. */
-    public function detect(): ServerStack
+    /**
+     * Probe the host and build an immutable ServerStack snapshot.
+     *
+     * When the operator has PINNED a single server (`--nginx-only` /
+     * `--apache-only`, or EDGE_FORCE_STRATEGY) the other one is irrelevant to the
+     * outcome, so we do not probe it at all: it reports absent across the board
+     * and its shell-outs (`apachectl -M`, `nginx -V`, `nginx -T`, `systemctl`) are
+     * skipped. That keeps a pinned run fast, and — more importantly — keeps the
+     * reported stack HONEST: `edge:status --nginx-only` must not claim Apache is
+     * part of a plan that will never touch it.
+     */
+    public function detect(?bool $nginxOnly = null, ?bool $apacheOnly = null): ServerStack
     {
-        $nginxInstalled  = $this->which('nginx');
-        $apacheInstalled = $this->which('apache2') || $this->which('httpd') || $this->which('apachectl');
+        $probeNginx  = $apacheOnly !== true;
+        $probeApache = $nginxOnly !== true;
+
+        $nginxInstalled  = $probeNginx && $this->which('nginx');
+        $apacheInstalled = $probeApache
+            && ($this->which('apache2') || $this->which('httpd') || $this->which('apachectl'));
 
         return new ServerStack(
             nginxInstalled:  $nginxInstalled,
-            nginxActive:     $this->active('nginx'),
+            nginxActive:     $probeNginx && $this->active('nginx'),
             nginxHasStream:  $nginxInstalled && $this->nginxHasStream(),
             apacheInstalled: $apacheInstalled,
-            apacheActive:    $this->active('apache2') || $this->active('httpd'),
+            apacheActive:    $probeApache && ($this->active('apache2') || $this->active('httpd')),
             nginxHasBrotli:  $nginxInstalled && $this->nginxHasBrotli(),
             apacheModules:   $apacheInstalled ? $this->apacheModules() : [],
             nginxHasStreamConfig: $nginxInstalled && $this->nginxStreamConfigExists((string) edge_config('paths.stream', '')),

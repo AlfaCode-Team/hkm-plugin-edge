@@ -98,7 +98,14 @@ final class SiteCollector
         // vhost, not just written to /etc/hosts. A production run keeps them out
         // (public domains resolve through DNS). Local domains still feed /etc/hosts
         // in both cases, so the loopback mapping is present for the served vhost.
-        $public = $this->serveLocalInServer()
+        //
+        // FALLBACK: a project whose domains are ALL local has nothing else it could
+        // possibly serve, so serve them regardless of mode. Dropping them there
+        // rendered a config with no `server {}` block at all — an empty file that
+        // still reported "1 site(s)", which reads as "the tool is broken" rather
+        // than "your only domains are dev domains". Filtering local domains OUT
+        // stays meaningful for a site that also has public ones.
+        $public = $this->serveLocalInServer() || $cls['public'] === []
             ? array_values(array_unique([...$cls['public'], ...$cls['local']]))
             : $cls['public'];
 

@@ -42,7 +42,7 @@ final class ConfigRenderer
                 // we reuse it and emit ONLY the internal backend vhosts, so we
                 // never write a second, conflicting `stream {}` block.
                 ($reuseStream ? $this->reuseStreamBanner() : $this->stream($sites) . "\n")
-                    . $this->nginxVhosts($sites, $tls->withMode(TlsMode::Ssl), $httpPort, $this->nginxInternalPort(), $stack, $profile),
+                    . $this->nginxVhosts($sites, $tls->withMode(TlsMode::Ssl), $httpPort, $this->nginxInternalPort(), $stack, $profile, $this->usesProxyProtocol(true)),
             ],
             Strategy::NginxOnly => [
                 (string) edge_config('paths.nginx'),
@@ -51,7 +51,7 @@ final class ConfigRenderer
                 // runs an SNI `stream {}` router that already owns :443. Emitting
                 // `listen 443 ssl` there would collide and stop nginx entirely. The
                 // :80→HTTPS redirect still targets the PUBLIC port (below).
-                $this->nginxVhosts($sites, $tls, $httpPort, $this->nginxSslListenPort($stack), $stack, $profile),
+                $this->nginxVhosts($sites, $tls, $httpPort, $this->nginxSslListenPort($stack), $stack, $profile, $this->usesProxyProtocol($stack->nginxHasStreamConfig || (bool) edge_config('behind_sni_router', false))),
             ],
             Strategy::ApacheOnly => [
                 (string) edge_config('paths.apache'),
@@ -59,6 +59,23 @@ final class ConfigRenderer
             ],
             Strategy::None => ['', ''],
         };
+    }
+
+    /**
+     * Should the backend vhosts expect a PROXY protocol header?
+     *
+     * Only when the operator turned it on AND this vhost actually sits behind an
+     * SNI router ($behindRouter) — a vhost clients reach directly would reject
+     * every request, because PROXY protocol is not optional once declared.
+     *
+     * When Edge writes the splitter it emits `proxy_protocol on` from this same
+     * flag, so the two ends cannot drift. When the splitter is someone else's
+     * (reused, or EDGE_BEHIND_SNI_ROUTER), the flag is the operator asserting
+     * that their router sends the header.
+     */
+    private function usesProxyProtocol(bool $behindRouter): bool
+    {
+        return $behindRouter && (bool) edge_config('security.proxy_protocol', false);
     }
 
     /**
@@ -104,22 +121,34 @@ stream {
         listen %LISTEN%;
         proxy_pass $backend_name;
         ssl_preread on;
-    }
+%PROXYPROTO%    }
 }
 NGINX;
+
+        // A plain L4 proxy_pass rewrites the source address, so every visitor
+        // reaches the backend as 127.0.0.1: per-IP rate limits become one shared
+        // bucket, and (with the Cloudflare real-IP prelude on) 127.0.0.1 is a
+        // TRUSTED proxy, so a client can send its own CF-Connecting-IP and choose
+        // its rate-limit identity. PROXY protocol carries the true peer instead.
+        // The backend `listen … proxy_protocol` is emitted from the same flag —
+        // enabling one end alone breaks every request.
+        $proxyProtocol = (bool) edge_config('security.proxy_protocol', false)
+            ? "        proxy_protocol on;\n"
+            : '';
 
         return $this->fill($tpl, [
             '%NGINX%'  => (string) edge_config('upstreams.nginx'),
             '%APACHE%' => (string) edge_config('upstreams.apache'),
             '%LISTEN%' => (string) (int) edge_config('listen', 443),
             '%MAP%'    => $map,
+            '%PROXYPROTO%' => $proxyProtocol,
         ]);
     }
 
     // ── per-project nginx vhosts ──────────────────────────────────────────────
 
     /** @param list<Site> $sites */
-    private function nginxVhosts(array $sites, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile): string
+    private function nginxVhosts(array $sites, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile, bool $proxyProtocol = false): string
     {
         $out = "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n";
 
@@ -151,8 +180,8 @@ NGINX;
                 continue;
             }
             $out .= "\n" . ($site->model === ServeModel::Swoole
-                ? $this->nginxSwoole($site, $tls, $httpPort, $sslPort, $stack, $profile)
-                : $this->nginxFpm($site, $tls, $httpPort, $sslPort, $stack, $profile));
+                ? $this->nginxSwoole($site, $tls, $httpPort, $sslPort, $stack, $profile, $proxyProtocol)
+                : $this->nginxFpm($site, $tls, $httpPort, $sslPort, $stack, $profile, $proxyProtocol));
         }
 
         return rtrim($out, "\n") . "\n";
@@ -288,7 +317,10 @@ NGINX;
         return [
             'dev'            => $dev,
             'logs'           => $logs,
-            'rateLimit'      => $this->nginxRateLimit($profile),
+            'limits'         => $this->nginxRequestLimits(),
+            'uploads'        => $this->nginxUploadGuard($locHeaders),
+            'lockdown'       => $this->nginxCloudflareOnly(),
+            'rateLimit'      => $this->nginxRateLimit($profile, 8),
             'compression'    => $compression,
             'serverHeaders'  => $serverHeaders,
             'banner'         => $profile->banner(),
@@ -366,9 +398,153 @@ NGINX;
             . "{$pad}add_header X-Frame-Options \"SAMEORIGIN\" always;\n"
             . "{$pad}add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n";
 
+        // ── Isolation ─────────────────────────────────────────────────────────
+        // Permissions-Policy turns off device APIs the app never asked for, so an
+        // injected script cannot reach the camera/mic/geolocation. COOP/CORP cut
+        // the cross-origin references that make Spectre-class leaks and
+        // cross-origin embedding possible. Each is skipped when set empty.
+        foreach ([
+            'Permissions-Policy'           => (string) edge_config('security.permissions_policy', ''),
+            'Cross-Origin-Opener-Policy'   => (string) edge_config('security.coop', ''),
+            'Cross-Origin-Resource-Policy' => (string) edge_config('security.corp', ''),
+        ] as $header => $value) {
+            if ($value !== '') {
+                $out .= "{$pad}add_header {$header} \"{$this->escapeNginx($value)}\" always;\n";
+            }
+        }
+
+        // ── CSP (opt-in — a wrong policy breaks the site) ─────────────────────
+        $csp = (string) edge_config('security.csp', '');
+        if ($csp !== '') {
+            $name = (bool) edge_config('security.csp_report_only', false)
+                ? 'Content-Security-Policy-Report-Only'
+                : 'Content-Security-Policy';
+            $out .= "{$pad}add_header {$name} \"{$this->escapeNginx($csp)}\" always;\n";
+        }
+
         // ── HSTS (TLS only) ───────────────────────────────────────────────────
         if ($tls->mode->usesTls()) {
             $out .= $this->nginxHsts($indent, $profile);
+        }
+
+        return $out;
+    }
+
+    /**
+     * httpoxy (CVE-2016-5385). A request header `Proxy: http://evil` becomes the
+     * CGI variable HTTP_PROXY, which many HTTP clients read as "route my outbound
+     * calls through here" — turning any server-side request the app makes into a
+     * man-in-the-middle. The distro's fastcgi_params does not clear it, and the
+     * variable is only ever attacker-supplied, so blank it unconditionally.
+     */
+    private function fastcgiHttpoxyGuard(): string
+    {
+        return (bool) edge_config('security.httpoxy_guard', true)
+            ? "        # httpoxy (CVE-2016-5385): never let a `Proxy:` header become HTTP_PROXY.\n"
+                . "        fastcgi_param HTTP_PROXY \"\";\n"
+            : '';
+    }
+
+    /**
+     * The request-body ceiling plus the slow-request guards.
+     *
+     * nginx ships 60-second header and body timeouts, so a few dozen sockets
+     * dribbling one byte at a time (Slowloris / slow POST) can occupy every
+     * worker slot without ever completing a request. These bound how long a
+     * client may take, and how much header a request may carry.
+     */
+    private function nginxRequestLimits(): string
+    {
+        $body = (string) edge_config('security.max_body', '25m');
+        $out  = '    client_max_body_size ' . (preg_match('#^\d+[kmg]?$#i', $body) ? $body : '25m') . ";\n";
+
+        if (!(bool) edge_config('security.timeouts.enabled', true)) {
+            return $out;
+        }
+
+        $t = static function (string $key, string $fallback): string {
+            $v = (string) edge_config('security.timeouts.' . $key, $fallback);
+
+            return preg_match('#^\d+(ms|s|m|h)?$#', $v) ? $v : $fallback;
+        };
+        $buffers = (string) edge_config('security.timeouts.header_buffers', '4 16k');
+
+        return $out
+            . "    # Slow-request guards (Slowloris / slow POST).\n"
+            . '    client_header_timeout ' . $t('client_header', '10s') . ";\n"
+            . '    client_body_timeout ' . $t('client_body', '15s') . ";\n"
+            . '    send_timeout ' . $t('send', '30s') . ";\n"
+            . '    keepalive_timeout ' . $t('keepalive', '30s') . ";\n"
+            . '    large_client_header_buffers ' . (preg_match('#^\d+ \d+[kmg]?$#i', $buffers) ? $buffers : '4 16k') . ";\n"
+            . "    reset_timedout_connection on;\n";
+    }
+
+    /**
+     * Harden the user-upload paths. Uploads are served from the app's OWN origin,
+     * so an uploaded `.svg` — which may contain `<script>` — or an `.html` file is
+     * stored XSS against every session on the domain. `storage` is deliberately
+     * not in the deny list (the public/storage symlink serves intended uploads),
+     * so the exposure is real by design.
+     *
+     *   attachment  — force a download instead of rendering it inline (default)
+     *   deny-risky  — refuse the dangerous extensions under these paths outright
+     *   off         — emit nothing
+     */
+    private function nginxUploadGuard(string $locHeaders): string
+    {
+        $mode = strtolower(trim((string) edge_config('security.uploads.mode', 'attachment')));
+        if (!in_array($mode, ['attachment', 'deny-risky'], true)) {
+            return '';
+        }
+
+        $paths = [];
+        foreach ((array) edge_config('security.uploads.paths', []) as $path) {
+            $path = trim((string) $path, '/ ');
+            // `..` is rejected outright: the charset alone would admit `../etc`,
+            // which builds a location matching a path that is not under the site.
+            if ($path !== '' && !str_contains($path, '..') && preg_match('#^[A-Za-z0-9._/-]+$#', $path)) {
+                $paths[] = $path;
+            }
+        }
+        if ($paths === []) {
+            return '';
+        }
+
+        $risky = (string) edge_config('security.uploads.risky_ext', 'svg|html|htm');
+        if (!preg_match('#^[A-Za-z0-9|\\\\]+$#', $risky)) {
+            $risky = 'svg|html|htm';
+        }
+
+        $out = "\n\n    # User uploads are same-origin: an uploaded .svg carries scripts, an\n"
+            . "    # uploaded .html runs as your site. Neutralise them here.\n";
+        foreach (array_unique($paths) as $path) {
+            $out .= $mode === 'deny-risky'
+                ? "    location ~* ^/{$path}/.*\\.({$risky})\$ { deny all; access_log off; }\n"
+                : "    location ~* ^/{$path}/.*\\.({$risky})\$ {\n"
+                    . "        add_header Content-Disposition \"attachment\" always;\n"
+                    . "        add_header Content-Security-Policy \"sandbox; default-src 'none'\" always;\n"
+                    . $locHeaders
+                    . "        try_files \$uri =404;\n    }\n";
+        }
+
+        return $out;
+    }
+
+    /**
+     * Strip identifying headers coming back from the upstream. PHP's `expose_php`
+     * emits `X-Powered-By: PHP/8.3.x`, which nginx forwards verbatim — handing
+     * every scanner the exact patch level to look up. `$directive` is
+     * fastcgi_hide_header (FPM) or proxy_hide_header (OpenSwoole).
+     */
+    private function hideUpstreamHeaders(string $directive, int $indent = 8): string
+    {
+        $pad = str_repeat(' ', $indent);
+        $out = '';
+        foreach ((array) edge_config('security.hide_upstream_headers', []) as $header) {
+            $header = trim((string) $header);
+            if ($header !== '' && preg_match('#^[A-Za-z0-9-]{1,64}$#', $header)) {
+                $out .= "{$pad}{$directive} {$header};\n";
+            }
         }
 
         return $out;
@@ -430,7 +606,7 @@ NGINX;
         // Source maps expose original unminified source — DENIED in production
         // (kept in development for debugging). This must be a deny, not just
         // removal from the static rule, or `location /`/try_files serves it.
-        $ext = 'env|log|sql|sqlite|bak|backup|swp|dist|sh|ini|conf|yml|yaml|lock';
+        $ext = $this->denyExtensions();
         if (!$profile->isDevelopment()) {
             $ext .= '|map';
         }
@@ -442,9 +618,56 @@ NGINX;
             . "    location ~ /\\.(?!well-known) { deny all; }\n\n"
             . "    # Sensitive file extensions — never served as static content.\n"
             . "    location ~* \\.({$ext})\$ {\n"
-            . "        deny all; access_log off; log_not_found off;\n    }";
+            . "        deny all; access_log off; log_not_found off;\n    }\n";
 
-        return $out;
+        // Exact filenames (build/deploy metadata) — no extension rule catches
+        // `composer.lock` or `Dockerfile`, and try_files would serve both.
+        $files = $this->denyFiles();
+        if ($files !== []) {
+            $out .= "\n    # Build/deploy metadata — fingerprints dependency versions.\n"
+                . "    location ~* ^/(?:.*/)?(" . implode('|', $files) . ")\$ {\n"
+                . "        deny all; access_log off; log_not_found off;\n    }\n";
+        }
+
+        return rtrim($out, "\n");
+    }
+
+    /**
+     * The `deny_ext` alternation, validated. Each entry must be a bare extension
+     * (or a tiny regex like `php\d`) so a config value can never close the
+     * location's regex and inject directives of its own.
+     */
+    private function denyExtensions(): string
+    {
+        $raw  = (string) edge_config('deny_ext', '');
+        $safe = [];
+        foreach (explode('|', $raw) as $ext) {
+            $ext = trim($ext);
+            if ($ext !== '' && preg_match('#^[A-Za-z0-9_\\\\-]{1,12}$#', $ext)) {
+                $safe[] = $ext;
+            }
+        }
+
+        return implode('|', array_unique($safe));
+    }
+
+    /**
+     * Exact filenames to deny, regex-quoted. Anything with a path separator or an
+     * unexpected character is dropped rather than escaped through.
+     *
+     * @return list<string>
+     */
+    private function denyFiles(): array
+    {
+        $out = [];
+        foreach ((array) edge_config('deny_files', []) as $name) {
+            $name = trim((string) $name);
+            if ($name !== '' && preg_match('#^[A-Za-z0-9._-]{1,64}$#', $name)) {
+                $out[] = str_replace('.', '\\.', $name);
+            }
+        }
+
+        return array_values(array_unique($out));
     }
 
     /**
@@ -467,7 +690,9 @@ NGINX;
         $out = [];
         foreach ((array) $list as $dir) {
             $dir = trim((string) $dir, '/ ');
-            if ($dir !== '' && preg_match('#^[A-Za-z0-9._/-]+$#', $dir)) {
+            // Same rule as the upload paths: the charset admits `..`, which would
+            // describe a location outside the site. Drop it rather than emit it.
+            if ($dir !== '' && !str_contains($dir, '..') && preg_match('#^[A-Za-z0-9._/-]+$#', $dir)) {
                 $out[] = $dir;
             }
         }
@@ -494,7 +719,7 @@ NGINX;
             . "    if (\$request_method !~ ^({$methods})\$) { return 405; }\n";
     }
 
-    private function nginxFpm(Site $site, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile): string
+    private function nginxFpm(Site $site, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile, bool $proxyProtocol = false): string
     {
         $paths = $this->pathBanner($site);
         $params = '';
@@ -502,7 +727,7 @@ NGINX;
             $params .= sprintf("        fastcgi_param %s \"%s\";\n", $k, $this->escapeNginx($v));
         }
 
-        [$listen, $ssl] = $this->nginxTls($tls, $httpPort, $sslPort);
+        [$listen, $ssl] = $this->nginxTls($tls, $httpPort, $sslPort, $proxyProtocol);
         $redirect = $tls->mode === TlsMode::Both
             ? $this->nginxRedirect($site->publicDomains, $site->publicRoot(), $httpPort, (int) edge_config('listen', 443)) . "\n\n"
             : '';
@@ -519,14 +744,15 @@ NGINX;
     index index.php;
 %SSL%
 %LOGS%%HEADERS%    server_tokens off;
-    client_max_body_size 25m;
-%METHODS%%RATELIMIT%%COMPRESSION%
-    # Front controller — only /index.php executes PHP.
+%LIMITS%%LOCKDOWN%%METHODS%%COMPRESSION%
+    # Front controller — only /index.php executes PHP. Everything dynamic lands
+    # here (`location /` try_files internally redirects to it), so this is where
+    # the rate limit belongs: it covers every application request and no asset.
     location = /index.php {
-        include fastcgi_params;
+%RATELIMIT%        include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root/index.php;
-%PARAMS%        fastcgi_pass %UPSTREAM%;
-
+%HTTPOXY%%PARAMS%        fastcgi_pass %UPSTREAM%;
+%HIDE%
         fastcgi_buffers 16 16k;
         fastcgi_buffer_size 32k;
         fastcgi_read_timeout 300s;
@@ -542,7 +768,7 @@ NGINX;
 
     # Any other .php file is not executed.
     location ~ \.php$ { return 404; }
-%DENY%
+%DENY%%UPLOADS%
 
     # Static assets (evaluated AFTER the deny rules above so nothing inside a
     # denied path can be served via a whitelisted extension).
@@ -581,6 +807,11 @@ NGINX;
             '%METHODS%'  => $c['methodGuard'],
             '%COMPRESSION%' => $c['compression'],
             '%RATELIMIT%' => $c['rateLimit'],
+            '%LIMITS%'   => $c['limits'],
+            '%LOCKDOWN%' => $c['lockdown'],
+            '%UPLOADS%'  => $c['uploads'],
+            '%HTTPOXY%'  => $this->fastcgiHttpoxyGuard(),
+            '%HIDE%'     => $this->hideUpstreamHeaders('fastcgi_hide_header'),
             '%FCHEADERS%' => $c['dynamicHeaders'],
             '%STATIC%'   => $c['static'],
             '%DENY%'     => $c['deny'],
@@ -665,10 +896,19 @@ NGINX;
     }
 
     /**
-     * Per-vhost `limit_req` / `limit_conn`, matching the zones in the prelude. The
+     * `limit_req` / `limit_conn`, matching the zones in the prelude. The
      * DEVELOPMENT profile uses a looser burst so rapid page reloads don't trip 429s.
+     *
+     * Emitted INSIDE the location that runs the application — the PHP front
+     * controller for FPM, the proxy location for OpenSwoole — never at server
+     * scope. At server scope every request pays the limit, so a single page load
+     * pulling 30 assets burns 31 tokens against the zone and a real visitor gets
+     * 429s on CSS/JS while the expensive dynamic request is what needed guarding.
+     * Static files are cheap to serve; only the application needs throttling.
+     *
+     * @param int $indent leading spaces — 8 for a location block (the only caller)
      */
-    private function nginxRateLimit(CacheProfile $profile): string
+    private function nginxRateLimit(CacheProfile $profile, int $indent = 8): string
     {
         if (!(bool) edge_config('http_prelude.enabled', false)
             || !(bool) edge_config('http_prelude.rate_limit.enabled', true)) {
@@ -681,9 +921,18 @@ NGINX;
         $nodelay  = (bool) edge_config('http_prelude.rate_limit.req_nodelay', true) ? ' nodelay' : '';
         $connZone = (string) edge_config('http_prelude.rate_limit.conn_zone', 'perip');
         $connLim  = (int) edge_config('http_prelude.rate_limit.conn_limit', 100);
+        $pad      = str_repeat(' ', $indent);
 
-        return "    limit_req zone={$reqZone} burst={$burst}{$nodelay};\n"
-            . "    limit_conn {$connZone} {$connLim};\n";
+        // nginx answers a tripped limit with 503 by default — which this vhost maps
+        // to /50x.html, so a throttled visitor sees the SERVER ERROR page and the
+        // event is indistinguishable from a real outage in logs and uptime checks.
+        // 429 is the correct signal and is what clients and CDNs back off on.
+        return "{$pad}# Throttle the application only — static assets are never rate-limited.\n"
+            . "{$pad}limit_req zone={$reqZone} burst={$burst}{$nodelay};\n"
+            . "{$pad}limit_conn {$connZone} {$connLim};\n"
+            . "{$pad}limit_req_status 429;\n"
+            . "{$pad}limit_conn_status 429;\n"
+            . "{$pad}limit_req_log_level warn;\n";
     }
 
     /**
@@ -768,9 +1017,9 @@ map $http_upgrade $connection_upgrade {
 NGINX . "\n";
     }
 
-    private function nginxSwoole(Site $site, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile): string
+    private function nginxSwoole(Site $site, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile, bool $proxyProtocol = false): string
     {
-        [$listen, $ssl] = $this->nginxTls($tls, $httpPort, $sslPort);
+        [$listen, $ssl] = $this->nginxTls($tls, $httpPort, $sslPort, $proxyProtocol);
         $redirect = $tls->mode === TlsMode::Both
             ? $this->nginxRedirect($site->publicDomains, $site->publicRoot(), $httpPort, (int) edge_config('listen', 443)) . "\n\n"
             : '';
@@ -825,8 +1074,7 @@ NGINX, ['%PATH%' => $sw->websocketPath, '%UPSTREAM%' => $upstream]);
     root %DOCROOT%;
 %SSL%
 %LOGS%%HEADERS%    server_tokens off;
-    client_max_body_size 25m;
-%METHODS%%RATELIMIT%%COMPRESSION%%DENY%
+%LIMITS%%LOCKDOWN%%METHODS%%COMPRESSION%%DENY%%UPLOADS%
 
     # Static assets are served straight off disk from the public root above (a
     # miss is a 404 — never forwarded to OpenSwoole). Evaluated AFTER the deny
@@ -834,9 +1082,11 @@ NGINX, ['%PATH%' => $sw->websocketPath, '%UPSTREAM%' => $upstream]);
 %STATIC%
 %HEALTH%%WEBSOCKET%
     # Normal application traffic → OpenSwoole. No Upgrade/Connection here; the
-    # WebSocket location above owns that.
+    # WebSocket location above owns that. OpenSwoole has no PHP location, so this
+    # proxy block is its equivalent of the FPM front controller — and, for the same
+    # reason, the only place the rate limit is applied.
     location / {
-        proxy_pass http://%UPSTREAM%;
+%RATELIMIT%        proxy_pass http://%UPSTREAM%;
         proxy_http_version 1.1;
 
         proxy_set_header Host              $host;
@@ -858,7 +1108,7 @@ NGINX, ['%PATH%' => $sw->websocketPath, '%UPSTREAM%' => $upstream]);
 
         proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
         proxy_next_upstream_tries 2;
-%PROXYHEADERS%    }
+%HIDE%%PROXYHEADERS%    }
 %DEVLOC%}
 NGINX;
 
@@ -877,6 +1127,10 @@ NGINX;
             '%METHODS%'      => $c['methodGuard'],
             '%COMPRESSION%'  => $c['compression'],
             '%RATELIMIT%'    => $c['rateLimit'],
+            '%LIMITS%'       => $c['limits'],
+            '%LOCKDOWN%'     => $c['lockdown'],
+            '%UPLOADS%'      => $c['uploads'],
+            '%HIDE%'         => $this->hideUpstreamHeaders('proxy_hide_header'),
             '%STATIC%'       => $c['static'],
             '%DENY%'         => $c['deny'],
             '%HEALTH%'       => $health,
@@ -894,15 +1148,30 @@ NGINX;
      *
      * @return array{0: string, 1: string} [listen directives, ssl block ('' when plain)]
      */
-    private function nginxTls(TlsConfig $tls, int $httpPort, int $sslPort): array
+    private function nginxTls(TlsConfig $tls, int $httpPort, int $sslPort, bool $proxyProtocol = false): array
     {
+        // PROXY protocol is spoken by the SNI stream router in front of this vhost
+        // (see stream()). It carries the real peer address that a plain L4
+        // proxy_pass would have replaced with 127.0.0.1 — so rate limits, logs and
+        // any allow/deny rule see the actual client again. The trailing real_ip
+        // lines are what turn the PROXY header into $remote_addr.
+        $pp     = $proxyProtocol ? ' proxy_protocol' : '';
+        $realIp = $proxyProtocol
+            ? "\n    # The SNI router in front speaks PROXY protocol; take the peer from it.\n"
+                . "    # This OVERRIDES any http-level real_ip_header for this vhost — behind\n"
+                . "    # Cloudflare that means \$remote_addr is the CF edge, not the visitor, but\n"
+                . "    # it is an address the client cannot choose (a CF-Connecting-IP header\n"
+                . "    # trusted from a 127.0.0.1 peer could be set to anything).\n"
+                . "    set_real_ip_from 127.0.0.1;\n    set_real_ip_from ::1;\n    real_ip_header proxy_protocol;"
+            : '';
+
         if ($tls->mode === TlsMode::None) {
-            return ["listen {$httpPort};\n    listen [::]:{$httpPort};", ''];
+            return ["listen {$httpPort}{$pp};\n    listen [::]:{$httpPort}{$pp};{$realIp}", ''];
         }
 
         // IPv4 + IPv6 listeners, mirroring the plain-HTTP redirect block so an
         // IPv6-only client that hits :80 has a :443 to be redirected to.
-        $listen = "listen {$sslPort} ssl;\n    listen [::]:{$sslPort} ssl;\n    http2 on;";
+        $listen = "listen {$sslPort} ssl{$pp};\n    listen [::]:{$sslPort} ssl{$pp};\n    http2 on;{$realIp}";
         $ssl    = "\n    ssl_certificate     {$tls->cert};\n    ssl_certificate_key {$tls->key};\n"
             . $this->nginxTlsHardening();
 
@@ -933,9 +1202,58 @@ NGINX;
 
         if ((bool) edge_config('ssl_hardening.stapling', false)) {
             $out .= "    ssl_stapling on;\n    ssl_stapling_verify on;\n";
+            // Without a resolver nginx cannot reach the CA's OCSP responder: it
+            // logs "no resolver defined to resolve …" and silently never staples,
+            // making the two directives above a no-op.
+            $resolver = (string) edge_config('ssl_hardening.resolver', '');
+            if ($resolver !== '' && preg_match('#^[0-9a-fA-F:. \[\]]+$#', $resolver)) {
+                $timeout = (string) edge_config('ssl_hardening.resolver_timeout', '5s');
+                $out .= "    resolver {$resolver} valid=300s;\n"
+                    . "    resolver_timeout " . (preg_match('#^\d+[smh]?$#', $timeout) ? $timeout : '5s') . ";\n";
+            }
+        }
+
+        // Authenticated Origin Pulls (mTLS): only a client presenting a cert from
+        // this CA may connect. With Cloudflare's origin-pull CA this makes the
+        // origin unreachable except through Cloudflare, even if its IP leaks.
+        $originCa = (string) edge_config('security.origin_pull_ca', '');
+        if ($originCa !== '') {
+            $out .= "    # Authenticated Origin Pulls — reject anything not fronted by the CA below.\n"
+                . "    ssl_client_certificate {$originCa};\n"
+                . "    ssl_verify_client on;\n";
         }
 
         return $out;
+    }
+
+    /**
+     * Restrict the vhost to Cloudflare's edge ranges. Trusting those ranges for
+     * the real client IP does NOT stop traffic that reaches the origin directly —
+     * an attacker who learns the origin address bypasses the WAF, the edge rate
+     * limits and the bot rules entirely. Loopback stays allowed so local health
+     * checks and the SNI splitter keep working.
+     */
+    private function nginxCloudflareOnly(): string
+    {
+        if (!(bool) edge_config('security.cloudflare_only', false)) {
+            return '';
+        }
+
+        $ranges = array_values(array_filter(array_map(
+            static fn ($r): string => trim((string) $r),
+            (array) edge_config('http_prelude.cloudflare.ranges', []),
+        )));
+        $ranges = $ranges === [] ? self::CLOUDFLARE_RANGES : $ranges;
+
+        $out = "\n    # Origin lockdown: only Cloudflare's edge may reach this vhost.\n"
+            . "    allow 127.0.0.1;\n    allow ::1;\n";
+        foreach ($ranges as $range) {
+            if (preg_match('#^[0-9a-fA-F:.]+/\d{1,3}$#', $range)) {
+                $out .= "    allow {$range};\n";
+            }
+        }
+
+        return $out . "    deny all;\n";
     }
 
     /**
@@ -976,7 +1294,11 @@ NGINX;
     /** @param list<Site> $sites */
     private function apacheVhosts(array $sites, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack): string
     {
-        $out = "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n";
+        $out = "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n"
+            // TraceEnable is a SERVER-CONFIG directive (Apache refuses it inside a
+            // <VirtualHost>), so it is emitted once here at file level. TRACE can
+            // echo back headers a browser would not otherwise expose.
+            . "\n# Refuse HTTP TRACE for this server (server-config context).\nTraceEnable Off\n";
         foreach ($sites as $site) {
             if (!$site->servesPublic()) {
                 continue;
@@ -999,20 +1321,31 @@ NGINX;
         }
 
         // PHP handler: FPM via mod_proxy_fcgi, or reverse-proxy for Swoole.
+        //
+        // FPM is scoped to index.php ONLY, mirroring nginx's front-controller
+        // rule. A blanket `<FilesMatch "\.php$">` executes ANY .php file that
+        // reaches the docroot — a leftover adminer.php, a file written by an
+        // upload bug — which is the single biggest gap this vhost used to have.
         if ($site->model === ServeModel::Swoole) {
             $handler = "    ProxyPreserveHost On\n    ProxyPass        / http://{$site->upstream}/\n    ProxyPassReverse / http://{$site->upstream}/";
         } else {
             $fcgi = str_starts_with($site->upstream, 'unix:')
                 ? 'proxy:' . $site->upstream . '|fcgi://localhost/'
                 : 'proxy:fcgi://' . $site->upstream;
-            $handler = "    <FilesMatch \"\\.php$\">\n        SetHandler \"{$fcgi}\"\n    </FilesMatch>";
+            // Files/FilesMatch sections merge in CONFIG ORDER, so the deny comes
+            // first and the front controller re-grants itself immediately after.
+            $handler = "    # Only the front controller executes PHP (mirrors the nginx rule):\n"
+                . "    # every other .php is refused, so a stray or uploaded script cannot run.\n"
+                . "    <FilesMatch \"\\.php$\">\n        Require all denied\n    </FilesMatch>\n"
+                . "    <Files \"index.php\">\n        Require all granted\n        SetHandler \"{$fcgi}\"\n    </Files>";
         }
 
         // Plain mode serves on :80; ssl/both serve the app on the TLS port.
         $vhostPort = $tls->mode === TlsMode::None ? $httpPort : $sslPort;
         $ssl = $tls->mode === TlsMode::None
             ? ''
-            : "\n    SSLEngine on\n    SSLCertificateFile    {$tls->cert}\n    SSLCertificateKeyFile {$tls->key}\n";
+            : "\n    SSLEngine on\n    SSLCertificateFile    {$tls->cert}\n    SSLCertificateKeyFile {$tls->key}\n"
+                . $this->apacheTlsHardening($stack);
         $redirect = $tls->mode === TlsMode::Both
             ? $this->apacheRedirect($site, $aliases, $httpPort) . "\n\n"
             : '';
@@ -1023,26 +1356,36 @@ NGINX;
         $hsts        = $tls->mode->usesTls() && $stack->apacheHasModule('headers') ? $this->apacheHsts() : '';
         $compression = $this->apacheCompression($stack);
 
+        $headers = $stack->apacheHasModule('headers') ? $this->apacheSecurityHeaders() : '';
+
         $tpl = <<<'APACHE'
 # Project: %NAME%
 %REDIRECT%<VirtualHost *:%PORT%>
     ServerName %PRIMARY%
 %ALIASES%    DocumentRoot %DOCROOT%
-
+%LOGS%
     <Directory %DOCROOT%>
-        AllowOverride All
+        # AllowOverride None: .htaccess is not consulted. It costs a stat on every
+        # path segment of every request, and any bug that lets a file be written
+        # into the docroot would otherwise become config injection.
+        AllowOverride None
         Require all granted
         Options -Indexes +FollowSymLinks
-    </Directory>
+%ROUTING%%METHODS%    </Directory>
+    # Dotfiles — directories AND files (a bare <DirectoryMatch> misses /.env).
     <DirectoryMatch "/\.">
         Require all denied
     </DirectoryMatch>
-%SSL%
-%HSTS%%COMPRESSION%%SETENV%%HANDLER%
+    <FilesMatch "^\.">
+        Require all denied
+    </FilesMatch>
+%DENY%%SSL%
+%HEADERS%%HSTS%%COMPRESSION%%SETENV%%HANDLER%
 
     ServerSignature Off
-    LimitRequestBody 26214400
-</VirtualHost>
+    # Strip the upstream's version-fingerprinting headers.
+%HIDE%    LimitRequestBody %MAXBODY%
+%REQTIMEOUT%</VirtualHost>
 APACHE;
 
         return $this->fill($tpl, [
@@ -1052,12 +1395,216 @@ APACHE;
             '%PRIMARY%'  => $site->publicDomains[0] ?? '_',
             '%ALIASES%'  => $aliases,
             '%DOCROOT%'  => $site->publicRoot(),
+            '%LOGS%'     => $this->apacheLogs($site),
+            '%ROUTING%'  => $this->apacheFrontController($site),
+            '%DENY%'     => $this->apacheDenyRules(),
             '%SSL%'      => $ssl,
+            '%HEADERS%'  => $headers,
             '%HSTS%'     => $hsts,
             '%COMPRESSION%' => $compression,
+            '%METHODS%'  => $this->apacheMethodGuard(),
+            '%HIDE%'     => $this->apacheHideHeaders($stack),
+            '%MAXBODY%'  => (string) $this->apacheMaxBodyBytes(),
+            '%REQTIMEOUT%' => $this->apacheReadTimeout($stack),
             '%SETENV%'   => $setenv,
             '%HANDLER%'  => $handler,
         ]);
+    }
+
+    /**
+     * Slowloris guard. mod_reqtimeout is compiled in on Debian/RHEL but can be
+     * disabled, and an unknown directive is a hard `configtest` failure — so this
+     * is gated on the module actually being loaded, like the other Apache extras.
+     */
+    private function apacheReadTimeout(ServerStack $stack): string
+    {
+        if (!(bool) edge_config('security.timeouts.enabled', true) || !$stack->apacheHasModule('reqtimeout')) {
+            return '';
+        }
+
+        return "    # Slow-request guard: headers within 10-20s, body at >= 500 B/s.\n"
+            . "    RequestReadTimeout header=10-20,MinRate=500 body=20,MinRate=500\n";
+    }
+
+    /**
+     * TLS hardening for Apache — the same protocol/cipher pinning the nginx side
+     * gets, so a project served by either front presents the same TLS surface.
+     */
+    private function apacheTlsHardening(ServerStack $stack): string
+    {
+        if (!$stack->apacheHasModule('ssl')) {
+            return '';
+        }
+        $protocols = (string) (edge_config('ssl_hardening.protocols') ?: 'TLSv1.2 TLSv1.3');
+        // nginx writes "TLSv1.2 TLSv1.3"; Apache wants "-all +TLSv1.2 +TLSv1.3".
+        $apache = '-all';
+        foreach (preg_split('/\s+/', trim($protocols)) ?: [] as $p) {
+            if (preg_match('#^TLSv1(\.[0-3])?$#', $p)) {
+                $apache .= ' +' . $p;
+            }
+        }
+        $ciphers = (string) (edge_config('ssl_hardening.ciphers') ?: '');
+
+        $out = "    SSLProtocol {$apache}\n    SSLHonorCipherOrder off\n";
+        if ($ciphers !== '' && preg_match('#^[A-Za-z0-9:+!_-]+$#', $ciphers)) {
+            $out .= "    SSLCipherSuite {$ciphers}\n";
+        }
+
+        return $out;
+    }
+
+    /**
+     * Front-controller routing for an Apache FPM site.
+     *
+     * This is REQUIRED, not a nicety. With `AllowOverride All` the application's
+     * own `public/.htaccess` supplied the "send anything that is not a real file
+     * to index.php" rewrite. Turning .htaccess off without replacing that rule
+     * leaves every URL except `/` returning 404.
+     *
+     * `FallbackResource` is core Apache (no mod_rewrite needed) and is the exact
+     * counterpart of the nginx `try_files $uri /index.php$is_args$args` line: a
+     * request for a file that exists is served, everything else goes to the front
+     * controller — with the query string preserved.
+     *
+     * OpenSwoole sites get nothing: `ProxyPass /` already forwards the whole URL
+     * space to the application server, so the docroot never handles routing.
+     */
+    private function apacheFrontController(Site $site): string
+    {
+        if ($site->model === ServeModel::Swoole) {
+            return '';
+        }
+
+        return "        # Front-controller routing. Replaces the app's public/.htaccess rewrite,\n"
+            . "        # which AllowOverride None (above) deliberately stops Apache reading.\n"
+            . "        DirectoryIndex index.php\n"
+            . "        FallbackResource /index.php\n";
+    }
+
+    /** Per-site Apache logs — the nginx vhosts have had these all along. */
+    private function apacheLogs(Site $site): string
+    {
+        if (!(bool) edge_config('per_site_logs', true)) {
+            return '';
+        }
+
+        return "\n    ErrorLog  /var/log/apache2/{$site->name}.error.log\n"
+            . "    CustomLog /var/log/apache2/{$site->name}.access.log combined";
+    }
+
+    /**
+     * The same security headers the nginx vhosts emit. `always` is Apache's
+     * `Header always set`, so they survive error responses too.
+     */
+    private function apacheSecurityHeaders(): string
+    {
+        $out = "    Header always set X-Content-Type-Options \"nosniff\"\n"
+            . "    Header always set X-Frame-Options \"SAMEORIGIN\"\n"
+            . "    Header always set Referrer-Policy \"strict-origin-when-cross-origin\"\n";
+
+        foreach ([
+            'Permissions-Policy'           => (string) edge_config('security.permissions_policy', ''),
+            'Cross-Origin-Opener-Policy'   => (string) edge_config('security.coop', ''),
+            'Cross-Origin-Resource-Policy' => (string) edge_config('security.corp', ''),
+        ] as $header => $value) {
+            if ($value !== '') {
+                $out .= "    Header always set {$header} \"{$this->escapeApache($value)}\"\n";
+            }
+        }
+
+        $csp = (string) edge_config('security.csp', '');
+        if ($csp !== '') {
+            $name = (bool) edge_config('security.csp_report_only', false)
+                ? 'Content-Security-Policy-Report-Only'
+                : 'Content-Security-Policy';
+            $out .= "    Header always set {$name} \"{$this->escapeApache($csp)}\"\n";
+        }
+
+        return $out;
+    }
+
+    /** `Header unset` for the upstream headers nginx hides via *_hide_header. */
+    private function apacheHideHeaders(ServerStack $stack): string
+    {
+        if (!$stack->apacheHasModule('headers')) {
+            return '';
+        }
+
+        $out = '';
+        foreach ((array) edge_config('security.hide_upstream_headers', []) as $header) {
+            $header = trim((string) $header);
+            if ($header !== '' && preg_match('#^[A-Za-z0-9-]{1,64}$#', $header)) {
+                $out .= "    Header always unset {$header}\n";
+            }
+        }
+        // httpoxy: Apache's own guard is to drop the request header before it can
+        // ever become the HTTP_PROXY CGI variable.
+        if ((bool) edge_config('security.httpoxy_guard', true)) {
+            $out .= "    RequestHeader unset Proxy early\n";
+        }
+
+        return $out;
+    }
+
+    /**
+     * The directory / extension / filename denials the nginx vhosts have. Without
+     * these Apache happily serves `/vendor/…`, `.env`, `composer.lock` and a
+     * stray `.sql` dump straight out of the public root.
+     */
+    private function apacheDenyRules(): string
+    {
+        $out = '';
+        foreach ($this->denyDirs() as $dir) {
+            $path = trim($dir, '/');
+            $out .= "    <DirectoryMatch \"/{$path}/\">\n        Require all denied\n    </DirectoryMatch>\n";
+        }
+
+        $ext = $this->denyExtensions();
+        if ($ext !== '') {
+            $out .= "    <FilesMatch \"\\.({$ext})\$\">\n        Require all denied\n    </FilesMatch>\n";
+        }
+
+        $files = $this->denyFiles();
+        if ($files !== []) {
+            $out .= '    <FilesMatch "^(' . implode('|', $files) . ")\$\">\n        Require all denied\n    </FilesMatch>\n";
+        }
+
+        return $out;
+    }
+
+    /**
+     * Method allowlist. Apache's <LimitExcept> works on the allowed set, so the
+     * configured `GET|HEAD|POST` alternation is split back into verbs.
+     */
+    private function apacheMethodGuard(): string
+    {
+        $methods = trim((string) edge_config('allowed_methods', ''));
+        if ($methods === '' || !preg_match('#^[A-Z|]+$#', $methods)) {
+            return '';
+        }
+
+        // <LimitExcept> is a DIRECTORY-context directive — Apache rejects it
+        // inside <VirtualHost> outright ("not allowed in <VirtualHost> context"),
+        // so it is emitted inside the docroot's <Directory> block.
+        return "        # Any verb outside this set is refused (CONNECT, WebDAV, …).\n"
+            . '        <LimitExcept ' . str_replace('|', ' ', $methods) . ">\n"
+            . "            Require all denied\n        </LimitExcept>\n";
+    }
+
+    /** LimitRequestBody takes bytes; security.max_body is nginx-style (25m). */
+    private function apacheMaxBodyBytes(): int
+    {
+        $raw = strtolower(trim((string) edge_config('security.max_body', '25m')));
+        if (!preg_match('#^(\d+)([kmg]?)$#', $raw, $m)) {
+            return 26214400;
+        }
+
+        return (int) $m[1] * match ($m[2]) {
+            'k'     => 1024,
+            'm'     => 1048576,
+            'g'     => 1073741824,
+            default => 1,
+        };
     }
 
     /**
