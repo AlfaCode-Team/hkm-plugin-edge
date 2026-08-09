@@ -73,8 +73,14 @@ final class EdgeService implements EdgeServiceContract
 
     public function plan(bool $all = false, ?string $tlsMode = null, ?string $sslCert = null, ?string $sslKey = null, ?string $appEnv = null, ?string $force = null): EdgePlan
     {
-        $stack    = $this->probe->detect();
-        $strategy = $stack->strategy($this->forcedStrategy($force));
+        // Resolve any operator override FIRST, so a pinned single-server run does
+        // not waste time probing (or reporting on) the server it will never use.
+        $forced   = $this->forcedStrategy($force);
+        $stack    = $this->probe->detect(
+            nginxOnly:  $forced === Strategy::NginxOnly,
+            apacheOnly: $forced === Strategy::ApacheOnly,
+        );
+        $strategy = $stack->strategy($forced);
 
         // When both servers run and nginx already has an SNI stream splitter,
         // reuse it (default) rather than writing a second `stream {}` block. A
@@ -194,6 +200,7 @@ final class EdgeService implements EdgeServiceContract
                 'strategy' => $plan->strategy->value,
                 'path'     => $plan->targetPath,
                 'sites'    => \count($plan->sites),
+                'served'   => $this->servedCount($plan),
                 'contents' => $plan->contents,
                 'hosts'    => $hosts,
                 'stream'   => $this->mergeExistingStream($plan, dryRun: true),
@@ -290,10 +297,29 @@ final class EdgeService implements EdgeServiceContract
             'strategy' => $plan->strategy->value,
             'path'     => $plan->targetPath,
             'sites'    => \count($plan->sites),
+            'served'   => $this->servedCount($plan),
             'steps'    => $steps,
             'hosts'    => $hosts,
             'stream'   => $stream,
         ];
+    }
+
+    /**
+     * How many of the plan's sites actually produced a `server {}` block. A site
+     * with no domain at all is collected but serves nothing, and the difference
+     * between "sites in scope" and "sites served" is exactly what tells an
+     * operator why the rendered file looks empty — so the commands report both.
+     */
+    private function servedCount(EdgePlan $plan): int
+    {
+        $served = 0;
+        foreach ($plan->sites as $site) {
+            if ($site->servesPublic()) {
+                $served++;
+            }
+        }
+
+        return $served;
     }
 
     /**

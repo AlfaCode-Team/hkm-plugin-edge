@@ -41,8 +41,11 @@ interface EdgeServiceContract
      * Write the rendered config, sync local domains to /etc/hosts, then
      * (optionally) validate + reload the server.
      *
+     * `sites` counts the projects in scope; `served` counts the ones that actually
+     * produced a vhost (a project with no usable domain renders nothing).
+     *
      * @return array{
-     *   ok: bool, strategy: string, path?: string, sites?: int,
+     *   ok: bool, strategy: string, path?: string, sites?: int, served?: int,
      *   dry_run?: bool, contents?: string, steps?: list<string>,
      *   hosts?: array<string, mixed>|null, message?: string
      * }

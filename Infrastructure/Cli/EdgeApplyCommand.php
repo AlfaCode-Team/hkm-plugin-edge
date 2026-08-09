@@ -130,15 +130,17 @@ final class EdgeApplyCommand extends AbstractCommand
         }
 
         if ($dryRun) {
-            $this->info('strategy: ' . $result['strategy'] . '  →  ' . $result['path'] . '  (' . ($result['sites'] ?? 0) . ' site(s))');
+            $this->info('strategy: ' . $result['strategy'] . '  →  ' . $result['path'] . '  ' . $this->siteSummary($result));
             $this->newLine();
             $this->muted($result['contents']);
+            $this->reportEmpty($result);
             $this->reportStream($result['stream'] ?? null, dryRun: true);
 
             return self::SUCCESS;
         }
 
-        $this->success('Edge applied [' . $result['strategy'] . ']');
+        $this->success('Edge applied [' . $result['strategy'] . '] ' . $this->siteSummary($result));
+        $this->reportEmpty($result);
         foreach ((array) ($result['steps'] ?? []) as $step) {
             $this->info('  - ' . $step);
         }
@@ -199,6 +201,41 @@ final class EdgeApplyCommand extends AbstractCommand
         $value = $this->option($name);
 
         return is_string($value) && $value !== '' ? $value : null;
+    }
+
+    /**
+     * "(2 site(s))", or "(3 site(s), 1 served)" when some site in scope produced
+     * no vhost — the count alone would otherwise imply everything was rendered.
+     *
+     * @param array<string, mixed> $result
+     */
+    private function siteSummary(array $result): string
+    {
+        $sites  = (int) ($result['sites'] ?? 0);
+        $served = (int) ($result['served'] ?? $sites);
+
+        return $served === $sites
+            ? "({$sites} site(s))"
+            : "({$sites} site(s), {$served} served)";
+    }
+
+    /**
+     * Nothing was rendered. Say WHY and what to do about it — an empty config file
+     * printed with no comment is the single most confusing thing this command can
+     * do, and it is always a scope/domain problem, never a failure.
+     *
+     * @param array<string, mixed> $result
+     */
+    private function reportEmpty(array $result): void
+    {
+        if ((int) ($result['served'] ?? 1) > 0) {
+            return;
+        }
+
+        $this->warning('No vhost was rendered — no project in scope has a usable domain.');
+        $this->muted('  • check "domains": [...] in this project\'s proj.json');
+        $this->muted('  • add --all to include every project in the global projects.json');
+        $this->muted('  • a hostname that fails validation is dropped silently — see EDGE_EXCLUDE_DOMAINS too');
     }
 
     /**

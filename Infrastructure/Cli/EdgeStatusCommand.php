@@ -71,8 +71,13 @@ final class EdgeStatusCommand extends AbstractCommand
                 $site->name,
                 $site->model->value,
                 $site->upstream,
-                $site->publicDomains === [] ? '(no public domains)' : implode(', ', $site->publicDomains),
+                $site->servesPublic()
+                    ? implode(', ', $site->publicDomains)
+                    : '(NO domains to serve — this site renders no vhost)',
             ));
+        }
+        if ($plan->sites !== [] && !array_filter($plan->sites, static fn ($s): bool => $s->servesPublic())) {
+            $this->warning('Nothing would be rendered — add "domains" to proj.json, or pass --all.');
         }
         $this->info('local domains  : ' . count($plan->localDomains) . ($plan->localDomains === [] ? '' : ' → /etc/hosts (' . implode(', ', $plan->localDomains) . ')'));
         $this->info('target         : ' . ($plan->targetPath === '' ? '(none)' : $plan->targetPath));
