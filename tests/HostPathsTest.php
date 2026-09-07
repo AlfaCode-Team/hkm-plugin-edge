@@ -128,14 +128,34 @@ final class HostPathsTest extends TestCase
 
     // ── platform defaults ─────────────────────────────────────────────────────
 
-    public function test_the_certificate_and_its_key_always_share_a_directory(): void
+    /**
+     * The pair shares a directory EXCEPT where the Linux split layout is real.
+     *
+     * The blanket "always share" form of this test passed on macOS and failed on
+     * Linux CI, because it contradicted what sslBase() deliberately does: where
+     * /etc/ssl/private exists it is the mode-0700 directory that makes filing the
+     * key apart from the certificate safe, and keeping the split is correct.
+     *
+     * The bug it was written for is the OTHER case — macOS has /etc/ssl/certs but
+     * no private/, so resolving each half independently filed the pair in two
+     * places and half the layout pointed at a directory that does not exist.
+     *
+     * It branches on the same condition the code does because sslBase() probes
+     * the real filesystem; there is no seam to inject a layout through.
+     */
+    public function test_the_certificate_and_its_key_share_a_directory_unless_the_split_layout_exists(): void
     {
-        // /etc/ssl/certs exists on macOS but /etc/ssl/private does not, so
-        // resolving each half independently filed the pair in two places.
-        self::assertSame(
-            dirname(HostPaths::defaultSslCert()),
-            dirname(HostPaths::defaultSslKey()),
-        );
+        $cert = HostPaths::defaultSslCert();
+        $key  = HostPaths::defaultSslKey();
+
+        if (is_dir('/etc/ssl/private')) {
+            self::assertSame('/etc/ssl/certs', dirname($cert));
+            self::assertSame('/etc/ssl/private', dirname($key));
+
+            return;
+        }
+
+        self::assertSame(dirname($cert), dirname($key));
     }
 
     public function test_the_hosts_file_default_matches_the_platform(): void

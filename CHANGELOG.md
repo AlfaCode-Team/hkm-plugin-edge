@@ -13,6 +13,22 @@ not only that a PHP signature changed. Always preview an upgrade with:
 hkm cli -p <project> edge:apply --dry-run
 ```
 
+## [2.1.1] — 2026-09-07
+
+### Fixed — a test that contradicted the behaviour it was guarding
+
+`HostPathsTest::test_the_certificate_and_its_key_always_share_a_directory`
+asserted that the pair ALWAYS shares a directory. That is only true where the
+Linux split layout is absent: where `/etc/ssl/private` exists it is the
+mode-0700 directory that makes filing the key apart from the certificate safe,
+and `sslBase()` keeps the split on purpose. The blanket assertion therefore
+passed on macOS — which has `/etc/ssl/certs` but no `private/` — and failed on
+Linux CI, where it contradicted the intended behaviour.
+
+**No runtime behaviour changed, and 2.1.0 is not broken for anyone**: the
+resolution was correct on both platforms already. Only the test was wrong, so
+2.1.0 shipped with a red CI rather than a defect.
+
 ## [2.1.0] — 2026-09-07
 
 ### Fixed — Edge ran on Debian and quietly did nothing anywhere else
