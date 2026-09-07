@@ -13,6 +13,179 @@ not only that a PHP signature changed. Always preview an upgrade with:
 hkm cli -p <project> edge:apply --dry-run
 ```
 
+## [2.1.0] — 2026-09-07
+
+### Fixed — Edge ran on Debian and quietly did nothing anywhere else
+
+Three host assumptions were compiled into the plugin as literals. Each one is
+the difference between a config that loads and one that does not, and none of
+them was visible on the platform they were written for.
+
+- **Service detection could never succeed without systemd.** `active()` falls
+  back to `pgrep` when `systemctl` is absent, but `pgrep` was missing from the
+  command allow-list, so the fallback was refused (exit 126) before it ran. On
+  macOS, in every container, on Alpine and the BSDs, both servers reported
+  inactive and `edge:apply` answered "No active web server detected" on a host
+  with nginx running. `pgrep` is now allow-listed.
+
+  Allow-listing it was necessary but NOT sufficient, and macOS stayed broken
+  after it: nginx rewrites its own process title, so the accounting name BSD
+  `pgrep` matches against is the whole string `nginx: master process
+  /opt/homebrew/opt/nginx/bin/nginx …`, and `pgrep -x nginx` — which demands an
+  EXACT match — finds nothing while nginx is plainly serving on :80. `active()`
+  now falls back from `-x` to a plain `pgrep`, a substring match on the process
+  NAME. Deliberately not `pgrep -f`, which matches the whole command line and
+  would count `tail -f /var/log/nginx/error.log` as a running nginx. Linux is
+  unaffected: there the title rewrite lands in `cmdline` while `/proc/<pid>/comm`
+  stays `nginx`, so `-x` matches and the fallback never runs.
+
+- **Per-site log directories were hard-coded** to `/var/log/nginx` and
+  `/var/log/apache2`. Neither exists on a Homebrew macOS host (`<prefix>/var/log/nginx`)
+  and the Apache one is `/var/log/httpd` on RHEL/Fedora — and nginx REFUSES to
+  start when an `access_log` directory is missing, so the generated config could
+  not be loaded at all. The directory is now detected from the server's own
+  compiled-in path (`nginx -V --error-log-path`, `apachectl -V`), then the
+  platform's conventional location, and when nothing resolves the per-site log
+  directives are OMITTED (the vhost falls back to the server's global log)
+  rather than naming a directory that is not there. Override with
+  `EDGE_NGINX_LOG_DIR` / `EDGE_APACHE_LOG_DIR`.
+
+- **`http2 on;` was emitted unconditionally.** That directive arrived in nginx
+  1.25.1; on anything older it is an "unknown directive" and `nginx -t` fails —
+  which is every current LTS (Ubuntu 22.04 ships 1.18, RHEL 9 ships 1.20,
+  Debian 12 ships 1.22). Edge now reads the installed version and emits the
+  `listen … ssl http2` parameter where the directive would fail. `EDGE_HTTP2`
+  (`auto` | `on` | `listen` | `off`) pins the choice when the nginx that LOADS
+  the config is not the one Edge probed.
+
+### Fixed — `edge:apply` crashed instead of reporting that there was nothing to do
+
+`strategy: none` means no web server is running, so the plan carries no vhost
+and no reload target — no `path`, no `contents`. Both output branches
+dereferenced them anyway. With `--dry-run` that was two "Undefined array key"
+warnings and then a `TypeError` from `muted(null)`: a stack trace instead of an
+answer. Without it the failure was quieter and worse — `Edge applied [none]`,
+reporting success for work that never happened.
+
+It is not an error state (local hosts may still have been synced), so it now
+reports what happened, names what would change it, and stops. The message also
+stops claiming "only local hosts were synced" when `--no-hosts` meant nothing
+was.
+
+### Added — the host's own start command when a server is installed but stopped
+
+`strategy: none` on a Homebrew Mac is the DEFAULT, not a malfunction: `brew
+install nginx` leaves the service stopped. Read on that machine, "No active web
+server detected" is indistinguishable from "this tool does not work here", and
+the difference is one command. Edge now names it — `sudo brew services start
+nginx` under Homebrew (with why `sudo` is needed for :80/:443), `sudo systemctl
+start …` under systemd, `net start …` on Windows — for exactly the servers that
+are installed and not running. It never starts anything itself: running a web
+server as root is the operator's decision, not a side effect of a config
+command.
+
+### Added — Windows detection
+
+Every probe was POSIX-only, so on Windows nothing was ever found: `command -v`
+is a POSIX **shell builtin** that cmd.exe does not have, and neither `systemctl`
+nor `pgrep` exists. `where` now replaces `command -v`, and `sc query` then
+`tasklist` replace the running-check. Both Windows probes read the OUTPUT rather
+than the exit code, which is the whole subtlety — `tasklist` exits 0 even when
+it matched nothing, and `sc query` exits 0 for a service that exists but is
+STOPPED, so trusting either would report every installed server as running.
+
+Detection works; the caveat is documented in the README. Neither server is a
+Windows *service* unless it was installed as one, so `tasklist` carries the
+common case of `nginx.exe` started by hand, and the `net start` hint says
+plainly that it applies only to a real service. The `config/edge.php` paths
+still assume a POSIX layout — a Windows host must set `EDGE_NGINX_PATH`,
+`EDGE_APACHE_PATH` and the log directories explicitly.
+
+### Fixed — the SNI-splitter strategy could not produce a loadable config
+
+When nginx AND Apache are both running and nginx has the `stream` module, Edge
+wrote the `stream {}` splitter and the backend `server {}` vhosts into ONE file.
+nginx accepts that nowhere: included at the main context it refuses `server`,
+included inside `http {}` it refuses `stream`. Every apply of that strategy —
+the whole reason the strategy exists — failed its own configtest.
+
+The two halves are now two files, each included where it belongs:
+
+- `EDGE_STREAM_PATH` — the `stream {}` splitter, at the nginx MAIN context;
+- `EDGE_NGINX_PATH` — the backend vhosts, inside `http {}` (the same file every
+  other strategy writes).
+
+`edge:apply` writes, backs up and rolls back BOTH together — a plan that rolled
+back half would leave a splitter and a vhost set describing different
+topologies. `--dry-run` prints both, and `edge:status` names both targets with
+the context each belongs in. When an existing splitter on the host is reused,
+there is still exactly one file (the vhosts) and the host's own splitter is
+merged into as before.
+
+Nothing can regress from this: no include of the old combined file has ever
+loaded.
+
+### Fixed — Apache directives that were not gated on their module
+
+Apache treats an unknown directive as a hard configtest failure, and three of
+them were emitted unconditionally:
+
+- **`SSLProtocol … +TLSv1.3`** needs Apache 2.4.36+ on OpenSSL 1.1.1+, which the
+  version alone does not tell you: macOS ships a current 2.4.67 linked against
+  LibreSSL, and RHEL 7 / Ubuntu 18.04 predate 1.1.1. `SSLProtocol: Illegal
+  protocol 'TLSv1.3'` took the whole vhost down — so every TLS mode of the
+  Apache strategy failed on those hosts. Edge now asks Apache itself (a
+  throwaway config that includes the host's own, then states the directive) and
+  drops the token where it is refused, with a comment saying why so the
+  remaining line is not mistaken for a deliberate TLS 1.2-only policy.
+- **`SetEnv`** is mod_env. Without it the project's run-env was also what stopped
+  the vhost loading; the keys are now listed in a comment instead.
+- **`RewriteEngine`** is mod_rewrite, which **Debian and Ubuntu do not enable by
+  default** (`a2enmod rewrite`), so `--tls=both` failed on a stock Apache. The
+  HTTPS redirect now degrades to `Redirect permanent` (mod_alias) and then to an
+  explanatory comment.
+
+### Changed
+
+- The PHP-FPM socket search covers the Homebrew (`/opt/homebrew`, `/usr/local`)
+  and BSD (`/var/run`) layouts as well as the Linux ones. The Linux resolution
+  order is unchanged.
+- `ssl.cert` / `ssl.key`, `hosts.path` and the `edge:service` target directory
+  default per platform instead of to the Debian path. The certificate and its
+  key always resolve to the SAME directory — `/etc/ssl/certs` exists on macOS
+  while `/etc/ssl/private` does not, and half a layout filed the pair in two
+  places.
+- `edge:service --write` on a host running neither systemd nor supervisor now
+  asks for an explicit `--write=<dir>` instead of creating `/etc/systemd/system`
+  and writing a unit nothing will ever read.
+- `nginx -V` and `apachectl -V` are read once per run instead of once per
+  question.
+
+### Added
+
+- `EDGE_NGINX_LOG_DIR`, `EDGE_APACHE_LOG_DIR`, `EDGE_HTTP2`, `EDGE_SYSTEMD_DIR`,
+  `EDGE_SUPERVISOR_DIR`.
+- `ConfigRenderer::renderStream()` and `EdgePlan::files()` / `EdgePlan::streamPath`
+  — the second file of a split plan. `apply()` returns `stream_path` alongside
+  `path`.
+- `Infrastructure\HostPaths` — where this host keeps its logs and which nginx
+  dialect it speaks. Constructing it does no I/O, so the renderer stays pure;
+  `HostPaths::fromBanners()` makes the resolution testable against a recorded
+  banner from any platform rather than only the machine the suite runs on.
+
+### Note for upgraders
+
+`edge:apply --dry-run` shows the difference. On a Debian/Ubuntu host with nginx
+1.25.1+ and mod_rewrite enabled, the single-server strategies render
+byte-identically to 2.0.3. Elsewhere they change — which is the point of the
+release.
+
+The SNI-splitter strategy changes everywhere, and its include lines must be
+updated: what used to be one `include hkm-edge-stream.conf;` becomes the
+splitter at the main context PLUS `include hkm-edge-nginx.conf;` inside
+`http {}`. `edge:apply` prints both paths with their contexts after a
+successful apply.
+
 ## [2.0.0] — 2026-08-09
 
 A security-hardening release. Every generated vhost gains defence-in-depth that

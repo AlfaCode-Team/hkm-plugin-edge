@@ -56,6 +56,15 @@ final class EdgeStatusCommand extends AbstractCommand
         $this->info('apache installed: ' . $yn($stack->apacheInstalled));
         $this->info('apache active   : ' . $yn($stack->apacheActive));
 
+        // The host facts that decide whether the rendered config can be LOADED.
+        $host = $this->edge->host();
+        $this->info('nginx version   : ' . ($host['nginx_version'] !== '' ? $host['nginx_version'] : '(unknown)'));
+        $this->info('nginx http2     : ' . $host['http2']);
+        $this->info('nginx log dir   : ' . ($host['nginx_log_dir'] !== '' ? $host['nginx_log_dir'] : '(none found — per-site logs will be omitted; set EDGE_NGINX_LOG_DIR)'));
+        if ($stack->apacheInstalled) {
+            $this->info('apache log dir  : ' . ($host['apache_log_dir'] !== '' ? $host['apache_log_dir'] : '(none found — per-site logs will be omitted; set EDGE_APACHE_LOG_DIR)'));
+        }
+
         $php = $this->edge->phpFpm();
         $this->info('php (cli)       : ' . $php['version']);
         $this->info('php-fpm socket  : ' . $php['socket']);
@@ -80,7 +89,10 @@ final class EdgeStatusCommand extends AbstractCommand
             $this->warning('Nothing would be rendered — add "domains" to proj.json, or pass --all.');
         }
         $this->info('local domains  : ' . count($plan->localDomains) . ($plan->localDomains === [] ? '' : ' → /etc/hosts (' . implode(', ', $plan->localDomains) . ')'));
-        $this->info('target         : ' . ($plan->targetPath === '' ? '(none)' : $plan->targetPath));
+        $this->info('target         : ' . ($plan->targetPath === '' ? '(none)' : $plan->targetPath) . ($plan->targetPath === '' ? '' : '   → include inside http { }'));
+        if ($plan->streamPath !== null) {
+            $this->info('target (stream): ' . $plan->streamPath . '   → include at the nginx MAIN context');
+        }
 
         return self::SUCCESS;
     }

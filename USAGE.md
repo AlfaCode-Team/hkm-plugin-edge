@@ -119,7 +119,7 @@ fallback**:
 
 | Detected stack | Strategy | Rendered config |
 |---|---|---|
-| nginx **and** Apache active, nginx has `stream` | `nginx-stream` | nginx SNI (L4) splitter: listed domains → nginx (`:444`), rest → Apache (`:8443`) |
+| nginx **and** Apache active, nginx has `stream` | `nginx-stream` | nginx SNI (L4) splitter: listed domains → nginx (`:444`), rest → Apache (`:8443`). **Two files** — the splitter at the nginx MAIN context (`EDGE_STREAM_PATH`) and the backend vhosts inside `http {}` (`EDGE_NGINX_PATH`); `edge:apply` prints both |
 | both active but nginx already has a `stream {}` splitter | `nginx-stream` (**reuse + merge**) | only the internal backend vhosts; the platform's domains are merged INTO the existing `map` in place |
 | only nginx active (or Apache inactive, or nginx lacks `stream`) | `nginx-only` | plain nginx reverse-proxy vhost |
 | only Apache active | `apache-only` | Apache SSL/HTTP VirtualHost |
@@ -172,7 +172,7 @@ hkm cli -p <project> edge:service --write=/tmp/units   # write into a specific d
 | `--supervisor` | Render a supervisor program block instead of a systemd unit |
 | `--all` | Include every registered project |
 | `--user=<name>` | User/group the service runs as (default: `www-data`) |
-| `--write[=dir]` | Write unit(s) to disk; optional target dir (default `/etc/systemd/system` or `/etc/supervisor/conf.d`) |
+| `--write[=dir]` | Write unit(s) to disk; optional target dir. The default is detected (`/etc/systemd/system`, the installed supervisor `conf.d`) and overridable with `EDGE_SYSTEMD_DIR` / `EDGE_SUPERVISOR_DIR`; on a host running neither manager the command asks for an explicit `--write=<dir>` instead of writing a unit nothing will read |
 | `--local` / `--dev` / `--development` / `-d` / `--production` | Same APP_ENV flags as `edge:apply` |
 
 After writing:
@@ -313,6 +313,8 @@ hkm cli -p shop edge:apply --production --all
 | `EDGE_NGINX_SSL_PORT` | *(auto)* | port the nginx-only vhost LISTENS on. Auto = 443 standalone, but the internal backend port (e.g. 444) when this host runs an SNI `stream {}` router that owns :443 — else nginx fails with "Address already in use". Auto-detected; force with `EDGE_BEHIND_SNI_ROUTER=1` or pin here |
 | `EDGE_BEHIND_SNI_ROUTER` | `false` | force "behind an SNI router" topology (vhost listens on the internal port, redirect targets the public port) |
 | `EDGE_PER_SITE_LOGS` | `true` | emit per-site access/error logs in every vhost (both profiles); false falls back to the global log |
+| `EDGE_NGINX_LOG_DIR` / `EDGE_APACHE_LOG_DIR` | *(auto)* | directory those logs are written to. Auto-detects the server's own compiled-in path (`nginx -V --error-log-path`, `apachectl -V DEFAULT_ERRORLOG`), then the platform default — `/var/log/nginx` vs `<prefix>/var/log/nginx` under Homebrew, `/var/log/apache2` vs `/var/log/httpd` on RHEL. Resolves to nothing → the directives are omitted, because nginx REFUSES to start when the directory is missing |
+| `EDGE_HTTP2` | `auto` | which HTTP/2 spelling to emit. `http2 on;` is a directive nginx 1.25.1+ understands; on 1.18/1.20/1.22 (Ubuntu 22.04, RHEL 9, Debian 12) it is an unknown directive and `nginx -t` fails, so `auto` emits `listen … ssl http2` there. `on` \| `listen` pin one; `off` disables HTTP/2 |
 | `EDGE_NGINX_BACKEND` | `127.0.0.1:444` | nginx TLS backend (stream) |
 | `EDGE_APACHE_BACKEND` | `127.0.0.1:8443` | Apache fallback backend (stream) |
 | `EDGE_APP_BACKEND` | `127.0.0.1:8080` | app upstream (nginx-only / Apache) |

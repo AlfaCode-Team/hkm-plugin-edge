@@ -6,6 +6,30 @@ domains, adapting to whatever is actually running on the machine.
 It probes the host, picks a strategy, renders the matching config, then
 validates and reloads the server.
 
+## Supported platforms
+
+Edge probes the host for what is installed and what is running, and every probe
+is platform-specific. What that means per OS:
+
+| | Binary lookup | "is it running" | Start hint when it is installed but stopped |
+|---|---|---|---|
+| **Linux** | `command -v` | `systemctl is-active`, then `pgrep -x` | `sudo systemctl start …`, or a generic line on a host without systemd (Alpine, OpenRC, containers) |
+| **macOS** | `command -v` | `pgrep -x` (no systemd) | `sudo brew services start …` where Homebrew is present, else generic |
+| **Windows** | `where` | `sc query`, then `tasklist` | `net start …`, qualified — see below |
+
+**A note on macOS.** `brew install nginx` leaves the service **stopped**, so
+`strategy: none` is the normal first result on a Mac, not a malfunction. Start
+the server and re-run; `edge:apply` names the exact command.
+
+**A note on Windows.** Detection works, but neither nginx nor Apache is a
+Windows *service* unless it was installed as one (nssm, winsw, or Apache's own
+installer). `tasklist` therefore carries the common case — `nginx.exe` started by
+hand from its install directory — and the `net start` hint says plainly that it
+applies only to a real service. The paths in `config/edge.php` still assume a
+POSIX layout, so a Windows host must set `EDGE_NGINX_PATH`, `EDGE_APACHE_PATH`
+and the log directories explicitly; only `EDGE_HOSTS_PATH` defaults correctly
+(`%SystemRoot%\System32\drivers\etc\hosts`).
+
 ## Strategy detection
 
 | Detected stack | Strategy | Rendered config |
@@ -94,8 +118,30 @@ raw TLS stream is forwarded to whichever backend the `map` picked. TLS is
 terminated by that backend (nginx on `:444`, Apache on `:8443`) — the stream
 layer never sees plaintext, so certificates live on the backends.
 
-> The `stream {}` block must live at the nginx **main context** (top level of
-> `nginx.conf`), **not** inside `http {}`. Include it: `include <path>;`
+### This strategy writes TWO files, at two different nginx contexts
+
+`stream {}` and `server {}` are not interchangeable — included at the main
+context nginx refuses `server`, inside `http {}` it refuses `stream` — so the
+splitter and the vhosts behind it are separate files:
+
+| File | Default | Include it |
+|---|---|---|
+| the `stream {}` splitter | `EDGE_STREAM_PATH` | at the **main context**, top level of `nginx.conf` |
+| the backend vhosts (TLS on `:444`) | `EDGE_NGINX_PATH` | inside **`http { … }`**, like any vhost file |
+
+```nginx
+# /etc/nginx/nginx.conf
+include /etc/nginx/hkm-edge-stream.conf;          # main context — the splitter
+http {
+    include /etc/nginx/sites-enabled/hkm.conf;    # http context — the vhosts
+}
+```
+
+`edge:apply` prints both paths with their contexts, writes them together, and
+rolls both back if the config test fails. When an existing splitter is reused
+(above) only the vhost file is written.
+
+The single-server strategies (`nginx-only`, `apache-only`) write one file.
 
 ## Commands
 
@@ -236,7 +282,10 @@ entries).
 | `EDGE_NGINX_BACKEND` | `127.0.0.1:444` | nginx TLS backend (stream) |
 | `EDGE_APACHE_BACKEND` | `127.0.0.1:8443` | Apache fallback backend (stream) |
 | `EDGE_APP_BACKEND` | `127.0.0.1:8080` | app upstream (nginx-only / Apache) |
-| `EDGE_SSL_CERT` / `EDGE_SSL_KEY` | `/etc/ssl/...` | cert used by nginx-only / Apache templates |
+| `EDGE_SSL_CERT` / `EDGE_SSL_KEY` | *(per platform)* | cert used by nginx-only / Apache templates — `/etc/ssl/{certs,private}` where that layout exists, else the server's own config dir |
+| `EDGE_NGINX_LOG_DIR` / `EDGE_APACHE_LOG_DIR` | *(auto)* | per-site log directory. Auto-detected from `nginx -V` / `apachectl -V`, then the platform's conventional location; when nothing resolves the log directives are omitted rather than pointing at a directory that does not exist |
+| `EDGE_HTTP2` | `auto` | HTTP/2 spelling: `auto` picks what the installed nginx understands (`http2 on;` needs 1.25.1+, older builds need `listen … ssl http2`), `on` \| `listen` pin one, `off` disables |
+| `EDGE_SYSTEMD_DIR` / `EDGE_SUPERVISOR_DIR` | *(auto)* | where `edge:service --write` puts the unit; empty when neither manager is installed, and the command then asks for `--write=<dir>` |
 | `EDGE_STREAM_PATH` / `EDGE_NGINX_PATH` / `EDGE_APACHE_PATH` | `var/edge/*.conf` | where each config is written (point at `/etc/nginx/...` in prod) |
 | `EDGE_FORCE_STRATEGY` | *(empty)* | pin a single server — `nginx-only` \| `apache-only` (no fallback); empty = auto-detect |
 | `EDGE_REUSE_STREAM` | `true` | reuse an existing nginx `stream {}` splitter instead of writing a second one |
@@ -245,7 +294,7 @@ entries).
 | `EDGE_EXTRA_DOMAINS` / `EDGE_EXCLUDE_DOMAINS` | — | comma-separated add/drop |
 | `EDGE_LOCAL_TLDS` | `local,test,localhost,example,invalid` | TLDs treated as local (→ /etc/hosts) |
 | `EDGE_MANAGE_HOSTS` | `true` | write local domains to /etc/hosts on apply |
-| `EDGE_HOSTS_PATH` / `EDGE_HOSTS_IP` | `/etc/hosts` / `127.0.0.1` | hosts file + loopback target |
+| `EDGE_HOSTS_PATH` / `EDGE_HOSTS_IP` | *(per platform)* / `127.0.0.1` | hosts file + loopback target |
 | `EDGE_LOCAL_IN_SERVER` | `false` | also include local domains in the server config |
 | `EDGE_SERVE_MODEL` | `fpm` | default serve model (`fpm` \| `swoole`); per-project override in `proj.json` |
 | `EDGE_FPM_SOCKET` | *(auto)* | pin the FPM socket/addr; empty = auto-resolve the socket matching the CLI PHP version |

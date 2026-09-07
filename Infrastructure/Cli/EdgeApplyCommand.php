@@ -6,6 +6,8 @@ namespace Plugins\Edge\Infrastructure\Cli;
 
 use AlfacodeTeam\PhpIoCli\AbstractCommand;
 use Plugins\Edge\API\Contracts\EdgeServiceContract;
+use Plugins\Edge\Domain\Strategy;
+use Plugins\Edge\Infrastructure\HostPaths;
 
 /**
  * edge:apply — detect the stack, render the matching config from the platform's
@@ -129,10 +131,41 @@ final class EdgeApplyCommand extends AbstractCommand
             return self::FAILURE;
         }
 
+        // NOTHING TO APPLY. `none` means no web server is RUNNING, so the plan
+        // carries no vhost and no reload target — it has neither `path` nor
+        // `contents`, which both branches below dereference unconditionally.
+        //
+        // Before this, --dry-run walked straight into that: two "Undefined array
+        // key" warnings and then a TypeError from muted(null), i.e. a stack trace
+        // instead of an answer. Without --dry-run it was quieter and worse, and
+        // printed "Edge applied [none]" — reporting success for work that never
+        // happened.
+        //
+        // It is not a failure: hosts may well have been synced, and on a Mac with
+        // Homebrew this is simply what an installed-but-stopped server looks like.
+        // So say what happened, say what would change it, and stop.
+        if (($result['strategy'] ?? null) === Strategy::None->value) {
+            $this->warning((string) ($result['message'] ?? 'No active web server detected.'));
+            foreach ((array) ($result['hints'] ?? []) as $hint) {
+                $this->muted((string) $hint);
+            }
+
+            return self::SUCCESS;
+        }
+
         if ($dryRun) {
             $this->info('strategy: ' . $result['strategy'] . '  →  ' . $result['path'] . '  ' . $this->siteSummary($result));
             $this->newLine();
             $this->muted($result['contents']);
+            // An SNI plan writes a SECOND file: the `stream {}` splitter, which
+            // is included at a different nginx context. Showing only one half of
+            // a --dry-run would be showing a config that cannot work.
+            if (($result['stream_path'] ?? null) !== null) {
+                $this->newLine();
+                $this->info('plus the SNI splitter  →  ' . $result['stream_path'] . '  (include at the nginx MAIN context)');
+                $this->newLine();
+                $this->muted((string) $result['stream_conf']);
+            }
             $this->reportEmpty($result);
             $this->reportStream($result['stream'] ?? null, dryRun: true);
 
@@ -143,6 +176,12 @@ final class EdgeApplyCommand extends AbstractCommand
         $this->reportEmpty($result);
         foreach ((array) ($result['steps'] ?? []) as $step) {
             $this->info('  - ' . $step);
+        }
+        if (($result['stream_path'] ?? null) !== null) {
+            $this->newLine();
+            $this->warning('This plan installs TWO files at DIFFERENT nginx contexts:');
+            $this->muted('  http { include ' . $result['path'] . '; }   ← the backend vhosts');
+            $this->muted('  include ' . $result['stream_path'] . ';   ← the SNI splitter, at the MAIN context');
         }
         $this->reportStream($result['stream'] ?? null, dryRun: false);
 
@@ -279,7 +318,7 @@ final class EdgeApplyCommand extends AbstractCommand
             return;
         }
         $count = (int) ($hosts['count'] ?? 0);
-        $path  = (string) ($hosts['path'] ?? '/etc/hosts');
+        $path  = (string) ($hosts['path'] ?? HostPaths::defaultHostsFile());
 
         if (($hosts['ok'] ?? false) !== true) {
             $this->warning("hosts: {$count} local domain(s) NOT written — " . ($hosts['message'] ?? 'error'));

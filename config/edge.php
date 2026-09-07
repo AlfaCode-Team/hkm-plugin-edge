@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Plugins\Edge\Infrastructure\HostPaths;
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  *  EDGE — web-server front configuration
@@ -137,8 +139,12 @@ return [
      * Per run: `edge:apply --ssl-cert=/path --ssl-key=/path`.
      */
     'ssl' => [
-        'cert' => (string) (env('EDGE_SSL_CERT') ?: '/etc/ssl/certs/hkm-edge.pem'),
-        'key'  => (string) (env('EDGE_SSL_KEY')  ?: '/etc/ssl/private/hkm-edge.key'),
+        // The default follows the HOST: `/etc/ssl/{certs,private}` where that
+        // layout exists (Linux), otherwise the server's own config directory —
+        // macOS and the BSDs have no `/etc/ssl/private`, and filing the key and
+        // the certificate in different places is worse than either choice.
+        'cert' => (string) (env('EDGE_SSL_CERT') ?: HostPaths::defaultSslCert()),
+        'key'  => (string) (env('EDGE_SSL_KEY')  ?: HostPaths::defaultSslKey()),
     ],
 
     /**
@@ -702,20 +708,90 @@ return [
      *   nginx   EDGE_NGINX_PATH   default: var/edge/hkm-edge-nginx.conf
      *   apache  EDGE_APACHE_PATH  default: var/edge/hkm-edge-apache.conf
      *
+     * TWO NGINX CONTEXTS, TWO FILES. `stream {}` and `server {}` are not
+     * interchangeable: included at the MAIN context nginx rejects `server`,
+     * inside `http {}` it rejects `stream`. So the SNI strategy writes the
+     * splitter to `stream` and the backend vhosts to `nginx`, and each is
+     * included where it belongs:
+     *
+     *   EDGE_NGINX_PATH=/etc/nginx/sites-enabled/hkm.conf   ← inside http {}
+     *   EDGE_STREAM_PATH=/etc/nginx/hkm-stream.conf         ← MAIN context
+     *       (top level of nginx.conf, NOT inside http {})
+     *
+     * The single-server strategies write ONE file: `nginx` or `apache`.
+     *
      * Defaults land under var/edge/ so you can generate and inspect the config
-     * with no root at all. In production point them at the real include dirs:
-     *
-     *   EDGE_NGINX_PATH=/etc/nginx/sites-enabled/hkm.conf
-     *   EDGE_STREAM_PATH=/etc/nginx/hkm-stream.conf   ← must be included at the
-     *       nginx MAIN context (top level of nginx.conf), NOT inside http {}.
-     *
-     * Writes are atomic (temp file + rename) and the previous file is backed up
-     * and restored automatically if the config test fails.
+     * with no root at all. Writes are atomic (temp file + rename) and every file
+     * the plan touches is backed up and restored together if the config test
+     * fails — a half-rolled-back SNI plan is two halves that disagree.
      */
     'paths' => [
         'stream' => (string) (env('EDGE_STREAM_PATH') ?: base_path('var/edge/hkm-edge-stream.conf')),
         'nginx'  => (string) (env('EDGE_NGINX_PATH')  ?: base_path('var/edge/hkm-edge-nginx.conf')),
         'apache' => (string) (env('EDGE_APACHE_PATH') ?: base_path('var/edge/hkm-edge-apache.conf')),
+    ],
+
+    /**
+     * 'logs'  —  where the per-site access/error logs are written.
+     *
+     *   nginx   EDGE_NGINX_LOG_DIR   default: '' (auto-detect)
+     *   apache  EDGE_APACHE_LOG_DIR  default: '' (auto-detect)
+     *
+     * Empty auto-detects from the server's OWN compiled-in log path (`nginx -V`
+     * --error-log-path, `apachectl -V` DEFAULT_ERRORLOG), then the conventional
+     * locations for the platform: /var/log/nginx on Linux,
+     * <prefix>/var/log/nginx under Homebrew; /var/log/apache2 on Debian and
+     * macOS, /var/log/httpd on RHEL/Fedora.
+     *
+     * This is not cosmetic: nginx REFUSES to start when an `access_log`
+     * directory does not exist, so a hard-coded Debian path made every generated
+     * config unloadable on macOS and every Apache config unloadable on RHEL. When
+     * NOTHING can be resolved, Edge omits the per-site log directives (the vhost
+     * falls back to the server's global log) rather than emit a config that
+     * cannot load.
+     *
+     * A value you set here is used VERBATIM and is never existence-checked — a
+     * deploy that creates the directory later is a legitimate setup.
+     * Set EDGE_PER_SITE_LOGS=0 to turn per-site logs off entirely.
+     */
+    'logs' => [
+        'nginx_dir'  => (string) env('EDGE_NGINX_LOG_DIR', ''),
+        'apache_dir' => (string) env('EDGE_APACHE_LOG_DIR', ''),
+    ],
+
+    /**
+     * 'http2'  EDGE_HTTP2  default: auto     values: auto | on | listen | off
+     *
+     *   auto    pick the spelling the INSTALLED nginx understands (default)
+     *   on      force `http2 on;`            — nginx >= 1.25.1 only
+     *   listen  force `listen … ssl http2`   — the pre-1.25.1 spelling
+     *   off     no HTTP/2
+     *
+     * Why this is a setting at all: `http2 on;` is a directive that arrived in
+     * nginx 1.25.1. On anything older it is an "unknown directive" and `nginx -t`
+     * FAILS — and that is every current LTS (Ubuntu 22.04 ships 1.18, Debian 12
+     * ships 1.22, RHEL 9 ships 1.20). The old `listen … ssl http2` parameter
+     * still works on modern builds but logs a deprecation warning, so `auto`
+     * emits it only when the probed version needs it.
+     *
+     * Pin it when the nginx that LOADS the config is not the one Edge probed —
+     * generating on a build host for a different server, or into a container.
+     */
+    'http2' => (string) (env('EDGE_HTTP2') ?: 'auto'),
+
+    /**
+     * 'service'  —  where `edge:service --write` puts the process-manager unit.
+     *
+     *   systemd     EDGE_SYSTEMD_DIR     default: /etc/systemd/system (if present)
+     *   supervisor  EDGE_SUPERVISOR_DIR  default: the installed conf.d directory
+     *
+     * Both auto-detect and BOTH resolve to '' on a host that runs neither — on
+     * which `edge:service --write` asks for an explicit target directory instead
+     * of dropping a systemd unit somewhere nothing will ever read it.
+     */
+    'service' => [
+        'systemd_dir'    => (string) (env('EDGE_SYSTEMD_DIR') ?: HostPaths::defaultSystemdDir()),
+        'supervisor_dir' => (string) (env('EDGE_SUPERVISOR_DIR') ?: HostPaths::defaultSupervisorDir()),
     ],
 
     /**
@@ -878,7 +954,7 @@ return [
      */
     'manage_hosts' => filter_var(env('EDGE_MANAGE_HOSTS', 'true'), FILTER_VALIDATE_BOOL),
     'hosts' => [
-        'path' => (string) (env('EDGE_HOSTS_PATH') ?: '/etc/hosts'),
+        'path' => (string) (env('EDGE_HOSTS_PATH') ?: HostPaths::defaultHostsFile()),
         'ip'   => (string) (env('EDGE_HOSTS_IP') ?: '127.0.0.1'),
     ],
 

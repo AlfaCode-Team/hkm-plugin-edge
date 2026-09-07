@@ -14,11 +14,17 @@ use Plugins\Edge\Domain\Strategy;
 use Plugins\Edge\Domain\TlsConfig;
 use Plugins\Edge\Domain\TlsMode;
 use Plugins\Edge\Infrastructure\ConfigRenderer;
+use Plugins\Edge\Infrastructure\HostPaths;
 
 /**
  * Feeds every generated DEVELOPMENT/PRODUCTION × TLS-mode vhost to a real
  * `nginx -t`. Skips cleanly when nginx is not installed so the suite still runs
  * everywhere, but proves the output is syntactically valid where it can.
+ *
+ * The config is rendered against the REAL host (its log directory, its nginx
+ * version) and validated unmodified. It used to be rewritten first — the log
+ * path replaced and `http2 on;` stripped — which meant the two directives most
+ * likely to be wrong for this machine were the two this test could never catch.
  */
 final class NginxSyntaxTest extends TestCase
 {
@@ -72,18 +78,20 @@ final class NginxSyntaxTest extends TestCase
         $stack = new ServerStack(true, true, false, false, false, false, [], false);
         $tls   = new TlsConfig($mode, $this->dir . '/cert.pem', $this->dir . '/key.pem');
 
-        [, $body] = (new ConfigRenderer())->render(Strategy::NginxOnly, [$site], $tls, $stack, $profile);
-
-        // Point log/fastcgi/cert paths at the sandbox; declare the rate-limit zones.
-        $body = str_replace(
-            ['/var/log/nginx/', 'include fastcgi_params;'],
-            [$this->dir . '/logs/', 'include ' . $this->dir . '/fastcgi_params;'],
-            $body,
+        // Render against THIS host: the sandbox log directory and the version of
+        // the very nginx that is about to validate the output. Nothing about the
+        // logs or the HTTP/2 spelling is rewritten afterwards — rewriting them is
+        // how the portability bug in both used to pass this test unnoticed.
+        $paths = new HostPaths(
+            nginxLogDir:  $this->dir . '/logs',
+            nginxVersion: $this->nginxVersion(),
         );
-        // `http2 on;` is valid only on nginx >= 1.25.1; strip it so the syntax
-        // check tolerates the older nginx that CI/distros ship (its presence is
-        // asserted separately by the behavioral test).
-        $body = (string) preg_replace('/^\s*http2 on;\R/m', '', $body);
+
+        [, $body] = (new ConfigRenderer($paths))->render(Strategy::NginxOnly, [$site], $tls, $stack, $profile);
+
+        // fastcgi_params lives at the server's own prefix, which the sandbox
+        // config does not share.
+        $body = str_replace('include fastcgi_params;', 'include ' . $this->dir . '/fastcgi_params;', $body);
         // Rewrite privileged ports to high ports — some nginx builds open the
         // listen sockets during `-t`, and CI runs non-root (can't bind <1024). The
         // real 80/443/444 ports are asserted by the behavioral tests.
@@ -119,6 +127,14 @@ final class NginxSyntaxTest extends TestCase
         // being wrong. A genuine config error would omit "syntax is ok".
         self::assertStringContainsString('syntax is ok', $output, $output);
         self::assertStringNotContainsString('[emerg]', $output, $output);
+    }
+
+    /** The version of the nginx that will validate the output, or null. */
+    private function nginxVersion(): ?string
+    {
+        $banner = (string) shell_exec($this->nginxBinary() . ' -v 2>&1');
+
+        return preg_match('#nginx/(\d+\.\d+\.\d+)#', $banner, $m) === 1 ? $m[1] : null;
     }
 
     private function nginxBinary(): ?string

@@ -20,14 +20,12 @@ use Plugins\Edge\API\Contracts\EdgeServiceContract;
  *   hkm edge:service --write=/tmp/units    # write into a specific directory
  *
  * Environment flags mirror edge:apply (--local / --development / -d / --production).
- * Writing to /etc/systemd/system needs root; afterwards run:
+ * The target directory is detected (EDGE_SYSTEMD_DIR / EDGE_SUPERVISOR_DIR
+ * override it); writing to /etc/systemd/system needs root. Afterwards run:
  *   systemctl daemon-reload && systemctl enable --now <unit>
  */
 final class EdgeServiceCommand extends AbstractCommand
 {
-    private const SYSTEMD_DIR    = '/etc/systemd/system';
-    private const SUPERVISOR_DIR = '/etc/supervisor/conf.d';
-
     public function __construct(private readonly EdgeServiceContract $edge)
     {
         parent::__construct();
@@ -84,7 +82,22 @@ final class EdgeServiceCommand extends AbstractCommand
 
         $dir = is_string($write) && $write !== ''
             ? rtrim($write, '/')
-            : ($supervisor ? self::SUPERVISOR_DIR : self::SYSTEMD_DIR);
+            : (string) edge_config($supervisor ? 'service.supervisor_dir' : 'service.systemd_dir', '');
+
+        // Neither manager is installed here (macOS, a BSD, a bare container).
+        // Creating /etc/systemd/system and writing a unit into it would look like
+        // success and start nothing, so ask for the real target instead.
+        if ($dir === '') {
+            $this->error($supervisor
+                ? 'No supervisor configuration directory found on this host.'
+                : 'No systemd unit directory found on this host.');
+            $this->muted('  Pass an explicit target: --write=/path/to/dir');
+            $this->muted($supervisor
+                ? '  or set EDGE_SUPERVISOR_DIR for this deployment.'
+                : '  or set EDGE_SYSTEMD_DIR for this deployment.');
+
+            return self::FAILURE;
+        }
 
         if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
             $this->error("Cannot create directory {$dir}");

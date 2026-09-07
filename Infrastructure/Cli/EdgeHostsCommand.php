@@ -6,6 +6,7 @@ namespace Plugins\Edge\Infrastructure\Cli;
 
 use AlfacodeTeam\PhpIoCli\AbstractCommand;
 use Plugins\Edge\API\Contracts\EdgeServiceContract;
+use Plugins\Edge\Infrastructure\HostPaths;
 
 /**
  * edge:hosts — sync the platform's LOCAL domains (.local / .test / …) into
@@ -44,7 +45,7 @@ final class EdgeHostsCommand extends AbstractCommand
         );
 
         $count   = (int) ($result['count'] ?? 0);
-        $path    = (string) ($result['path'] ?? '/etc/hosts');
+        $path    = (string) ($result['path'] ?? HostPaths::defaultHostsFile());
         $skipped = (array) ($result['skipped'] ?? []);
 
         if (($result['ok'] ?? false) !== true) {

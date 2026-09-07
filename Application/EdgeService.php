@@ -12,6 +12,7 @@ use Plugins\Edge\Domain\Strategy;
 use Plugins\Edge\Domain\TlsConfig;
 use Plugins\Edge\Domain\TlsMode;
 use Plugins\Edge\Infrastructure\ConfigRenderer;
+use Plugins\Edge\Infrastructure\HostPaths;
 use Plugins\Edge\Infrastructure\HostsFileWriter;
 use Plugins\Edge\Infrastructure\ServiceRenderer;
 use Plugins\Edge\Infrastructure\SiteCollector;
@@ -71,6 +72,24 @@ final class EdgeService implements EdgeServiceContract
         ];
     }
 
+    public function host(): array
+    {
+        $paths = HostPaths::detect($this->probe);
+        $mode  = strtolower(trim((string) (edge_config('http2', 'auto') ?: 'auto')));
+
+        return [
+            'nginx_log_dir'  => $paths->nginxLogDir,
+            'apache_log_dir' => $paths->apacheLogDir,
+            'nginx_version'  => $paths->nginxVersion ?? '',
+            'http2'          => match ($mode) {
+                'on', 'directive'   => 'http2 on; (pinned)',
+                'listen', 'legacy'  => 'listen … ssl http2 (pinned)',
+                'off', 'false', '0' => 'disabled',
+                default             => $paths->supportsHttp2Directive() ? 'http2 on;' : 'listen … ssl http2 (nginx < 1.25.1)',
+            },
+        ];
+    }
+
     public function plan(bool $all = false, ?string $tlsMode = null, ?string $sslCert = null, ?string $sslKey = null, ?string $appEnv = null, ?string $force = null): EdgePlan
     {
         // Resolve any operator override FIRST, so a pinned single-server run does
@@ -99,9 +118,22 @@ final class EdgeService implements EdgeServiceContract
         // Public domains → server config; local (.local/.test) → /etc/hosts.
         $sites = $this->sites->sites($all, $env);
 
-        [$path, $body] = $this->renderer->render($strategy, $sites, $this->resolveTls($tlsMode, $sslCert, $sslKey), $stack, $profile, $reuseStream);
+        // The renderer is pure and defaults to the Debian layout; a REAL apply
+        // renders against the paths this host actually has (log dirs) and the
+        // nginx dialect it actually speaks (the HTTP/2 spelling).
+        $renderer = $this->renderer->withHostPaths(HostPaths::detect($this->probe, $stack));
 
-        return new EdgePlan($stack, $strategy, $sites, $this->sites->localDomains($all), $path, $body, $reuseStream);
+        [$path, $body] = $renderer->render($strategy, $sites, $this->resolveTls($tlsMode, $sslCert, $sslKey), $stack, $profile, $reuseStream);
+
+        // The SNI splitter is a SECOND file at a different nginx context; null
+        // for every other strategy, and when an existing splitter is reused.
+        $stream = $renderer->renderStream($strategy, $sites, $reuseStream);
+
+        return new EdgePlan(
+            $stack, $strategy, $sites, $this->sites->localDomains($all), $path, $body, $reuseStream,
+            streamPath:     $stream[0] ?? null,
+            streamContents: $stream[1] ?? null,
+        );
     }
 
     /**
@@ -150,7 +182,7 @@ final class EdgeService implements EdgeServiceContract
         if (!$force && !$this->isDev()) {
             return [
                 'ok'      => false,
-                'path'    => (string) edge_config('hosts.path', '/etc/hosts'),
+                'path'    => (string) edge_config('hosts.path', HostPaths::defaultHostsFile()),
                 'count'   => 0,
                 'message' => 'refusing to touch the hosts file outside dev mode — run with `--dev` (or pass --force). '
                            . 'On a live server public domains resolve via DNS, not /etc/hosts.',
@@ -160,7 +192,7 @@ final class EdgeService implements EdgeServiceContract
         return $this->hosts->sync(
             domains: $this->sites->localDomains($all),
             ip:      (string) edge_config('hosts.ip', '127.0.0.1'),
-            path:    (string) edge_config('hosts.path', '/etc/hosts'),
+            path:    (string) edge_config('hosts.path', HostPaths::defaultHostsFile()),
             remove:  $remove,
             dryRun:  $dryRun,
         );
@@ -189,54 +221,51 @@ final class EdgeService implements EdgeServiceContract
                 'ok'       => ($hosts['ok'] ?? true) === true,
                 'strategy' => Strategy::None->value,
                 'hosts'    => $hosts,
-                'message'  => 'No active web server detected — only local hosts were synced.',
+                // Say what actually happened. `--no-hosts`, or a non-dev machine,
+                // leaves $hosts null and nothing at all was written — claiming
+                // hosts "were synced" there sends the operator looking for an
+                // /etc/hosts change that was never made.
+                'message'  => $hosts === null
+                    ? 'No active web server detected — nothing to write.'
+                    : 'No active web server detected — only local hosts were synced.',
+                // A server that is INSTALLED but stopped is the normal state on a
+                // Homebrew Mac, where `brew install nginx` leaves it stopped. The
+                // bare message above reads there as "this tool does not work on
+                // macOS" when the truth is one command away, so the probe names
+                // that command. Empty when nothing is installed to start.
+                'hints'    => $this->probe->startHints($plan->stack),
             ];
         }
 
         if ($dryRun) {
             return [
-                'ok'       => true,
-                'dry_run'  => true,
-                'strategy' => $plan->strategy->value,
-                'path'     => $plan->targetPath,
-                'sites'    => \count($plan->sites),
-                'served'   => $this->servedCount($plan),
-                'contents' => $plan->contents,
-                'hosts'    => $hosts,
-                'stream'   => $this->mergeExistingStream($plan, dryRun: true),
+                'ok'          => true,
+                'dry_run'     => true,
+                'strategy'    => $plan->strategy->value,
+                'path'        => $plan->targetPath,
+                'sites'       => \count($plan->sites),
+                'served'      => $this->servedCount($plan),
+                'contents'    => $plan->contents,
+                'stream_path' => $plan->streamPath,
+                'stream_conf' => $plan->streamContents,
+                'hosts'       => $hosts,
+                'stream'      => $this->mergeExistingStream($plan, dryRun: true),
             ];
         }
 
-        // 2. Write the server config atomically (temp file + rename) so a live
-        //    include never sees a half-written file.
-        $dir = dirname($plan->targetPath);
-        if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
-            return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Cannot create directory {$dir}"];
-        }
-        // Back up the CURRENT good config before overwriting it. The new file
-        // is written over the live path and only then validated, so without a
-        // backup a failed `nginx -t` left the broken config in place — and the
-        // next reload, by anyone (a deploy, logrotate, a reboot), would load it.
-        // The failure would surface later and somewhere else.
-        $backup = null;
-        if (is_file($plan->targetPath)) {
-            $backup = $plan->targetPath . '.bak-' . bin2hex(random_bytes(4));
-            if (!@copy($plan->targetPath, $backup)) {
-                return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Cannot back up {$plan->targetPath} — refusing to overwrite it"];
-            }
-        }
+        // 2. Write every file the plan produces, atomically (temp + rename) so a
+        //    live include never sees a half-written file. An SNI plan installs
+        //    TWO: the http-context vhosts and the main-context splitter.
+        $install = $this->installFiles($plan);
+        if ($install['ok'] !== true) {
+            $this->restoreBackups($install['backups']);
 
-        $tmp = $plan->targetPath . '.tmp';
-        if (@file_put_contents($tmp, $plan->contents) === false || !@rename($tmp, $plan->targetPath)) {
-            @unlink($tmp);
-            if ($backup !== null) {
-                @unlink($backup);
-            }
-            return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => "Failed to write {$plan->targetPath}"];
+            return ['ok' => false, 'strategy' => $plan->strategy->value, 'hosts' => $hosts, 'message' => $install['message']];
         }
-
+        $backups   = $install['backups'];
         $siteCount = \count($plan->sites);
-        $steps = ["wrote {$plan->targetPath} ({$siteCount} project site(s))"];
+        $steps     = $install['steps'];
+        $steps[0] .= " ({$siteCount} project site(s))";
 
         // 3. Reusing an existing SNI splitter → merge our domains into ITS map,
         //    editing that host file (e.g. nginx.conf) in place. Fail loudly: a
@@ -260,23 +289,22 @@ final class EdgeService implements EdgeServiceContract
             [$tc, $tout] = $this->probe->run($testCmd);
             $steps[] = "test: {$testCmd} → " . ($tc === 0 ? 'ok' : 'FAILED');
             if ($tc !== 0) {
-                // ROLL BACK. Leaving an invalid config at the live path turns a
-                // caught, reported failure into an outage the next time anything
-                // reloads the server.
-                if ($backup !== null && @rename($backup, $plan->targetPath)) {
-                    $steps[] = "rolled back {$plan->targetPath} to the previous config";
-                } elseif ($backup !== null) {
-                    $steps[] = "WARNING: could not restore {$plan->targetPath} from {$backup} — restore it manually before reloading";
+                // ROLL BACK — every file this apply wrote. Leaving an invalid
+                // config at a live path turns a caught, reported failure into an
+                // outage the next time anything reloads the server, and a split
+                // SNI plan that rolled back only half would be a config whose two
+                // halves disagree.
+                foreach ($this->restoreBackups($backups) as $step) {
+                    $steps[] = $step;
                 }
+                $backups = [];
 
                 return ['ok' => false, 'strategy' => $plan->strategy->value, 'path' => $plan->targetPath, 'steps' => $steps, 'hosts' => $hosts, 'message' => trim($tout)];
             }
 
-            // Validated: the backup has done its job.
-            if ($backup !== null) {
-                @unlink($backup);
-                $backup = null;
-            }
+            // Validated: the backups have done their job.
+            $this->discardBackups($backups);
+            $backups = [];
 
             [$rc, $rout] = $this->probe->run($reloadCmd);
             $steps[] = "reload: {$reloadCmd} → " . ($rc === 0 ? 'ok' : 'FAILED');
@@ -286,22 +314,91 @@ final class EdgeService implements EdgeServiceContract
         }
 
         // Nothing validated the write (reload was skipped), or it validated and
-        // the backup was already removed. Either way do not leave a stale
-        // .bak-* beside the live config.
-        if ($backup !== null) {
-            @unlink($backup);
-        }
+        // the backups were already removed. Either way do not leave a stale
+        // .bak-* beside a live config.
+        $this->discardBackups($backups);
 
         return [
-            'ok'       => true,
-            'strategy' => $plan->strategy->value,
-            'path'     => $plan->targetPath,
-            'sites'    => \count($plan->sites),
-            'served'   => $this->servedCount($plan),
-            'steps'    => $steps,
-            'hosts'    => $hosts,
-            'stream'   => $stream,
+            'ok'          => true,
+            'strategy'    => $plan->strategy->value,
+            'path'        => $plan->targetPath,
+            'stream_path' => $plan->streamPath,
+            'sites'       => \count($plan->sites),
+            'served'      => $this->servedCount($plan),
+            'steps'       => $steps,
+            'hosts'       => $hosts,
+            'stream'      => $stream,
         ];
+    }
+
+    /**
+     * Write every file in the plan, each atomically, backing up whatever is
+     * already there first.
+     *
+     * The new file is written over the LIVE path and only then validated, so
+     * without a backup a failed `nginx -t` left the broken config in place — and
+     * the next reload by anyone (a deploy, logrotate, a reboot) would load it,
+     * surfacing the failure later and somewhere else.
+     *
+     * @return array{ok: bool, backups: array<string, string>, steps: list<string>, message: string}
+     */
+    private function installFiles(EdgePlan $plan): array
+    {
+        $backups = [];
+        $steps   = [];
+
+        foreach ($plan->files() as $path => $contents) {
+            $dir = dirname($path);
+            if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+                return ['ok' => false, 'backups' => $backups, 'steps' => $steps, 'message' => "Cannot create directory {$dir}"];
+            }
+
+            if (is_file($path)) {
+                $backup = $path . '.bak-' . bin2hex(random_bytes(4));
+                if (!@copy($path, $backup)) {
+                    return ['ok' => false, 'backups' => $backups, 'steps' => $steps, 'message' => "Cannot back up {$path} — refusing to overwrite it"];
+                }
+                $backups[$path] = $backup;
+            }
+
+            $tmp = $path . '.tmp';
+            if (@file_put_contents($tmp, $contents) === false || !@rename($tmp, $path)) {
+                @unlink($tmp);
+
+                return ['ok' => false, 'backups' => $backups, 'steps' => $steps, 'message' => "Failed to write {$path}"];
+            }
+
+            $steps[] = "wrote {$path}";
+        }
+
+        return ['ok' => true, 'backups' => $backups, 'steps' => $steps, 'message' => ''];
+    }
+
+    /**
+     * Put every backed-up file back and report what happened, so a half-applied
+     * plan never survives a failed validation.
+     *
+     * @param  array<string, string> $backups live path => backup path
+     * @return list<string>
+     */
+    private function restoreBackups(array $backups): array
+    {
+        $steps = [];
+        foreach ($backups as $path => $backup) {
+            $steps[] = @rename($backup, $path)
+                ? "rolled back {$path} to the previous config"
+                : "WARNING: could not restore {$path} from {$backup} — restore it manually before reloading";
+        }
+
+        return $steps;
+    }
+
+    /** @param array<string, string> $backups */
+    private function discardBackups(array $backups): void
+    {
+        foreach ($backups as $backup) {
+            @unlink($backup);
+        }
     }
 
     /**

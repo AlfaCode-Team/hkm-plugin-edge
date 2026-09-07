@@ -24,6 +24,22 @@ interface EdgeServiceContract
     public function phpFpm(): array;
 
     /**
+     * What was detected about the HOST itself: where each server keeps its logs,
+     * which nginx version is installed, and therefore which HTTP/2 spelling the
+     * generated config will use.
+     *
+     * These decide whether the rendered config can be LOADED at all (nginx
+     * refuses to start on a missing log directory, and `http2 on;` is an unknown
+     * directive before 1.25.1), so `edge:status` reports them rather than leaving
+     * a wrong guess to surface as a failed reload.
+     *
+     * An empty log directory means "no per-site log directives will be emitted".
+     *
+     * @return array{nginx_log_dir: string, apache_log_dir: string, nginx_version: string, http2: string}
+     */
+    public function host(): array;
+
+    /**
      * Detect + collect sites + render — WITHOUT touching the filesystem.
      * $all=false (default) scopes to the CURRENT project; true = every project.
      *
@@ -44,8 +60,14 @@ interface EdgeServiceContract
      * `sites` counts the projects in scope; `served` counts the ones that actually
      * produced a vhost (a project with no usable domain renders nothing).
      *
+     * An SNI-splitter plan installs TWO files at DIFFERENT nginx contexts —
+     * `path` holds the backend vhosts (include inside `http {}`) and
+     * `stream_path` the `stream {}` splitter (include at the MAIN context).
+     * `stream_path` is null for every other strategy.
+     *
      * @return array{
-     *   ok: bool, strategy: string, path?: string, sites?: int, served?: int,
+     *   ok: bool, strategy: string, path?: string, stream_path?: string|null,
+     *   stream_conf?: string|null, sites?: int, served?: int,
      *   dry_run?: bool, contents?: string, steps?: list<string>,
      *   hosts?: array<string, mixed>|null, message?: string
      * }

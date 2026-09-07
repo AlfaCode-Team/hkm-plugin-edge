@@ -56,15 +56,20 @@ final class SecurityHardeningTest extends TestCase
             ? new ServerStack(false, false, false, true, true, false, $apacheModules, false)
             : new ServerStack(true, true, false, false, false, false, [], false);
 
-        [, $body] = (new ConfigRenderer())->render(
-            $strategy,
-            [$this->site($model)],
-            new TlsConfig($mode, '/etc/ssl/certs/x.pem', '/etc/ssl/private/x.key'),
-            $stack,
-            CacheProfile::Production,
-        );
+        $renderer = new ConfigRenderer();
+        $sites    = [$this->site($model)];
+        $tls      = new TlsConfig($mode, '/etc/ssl/certs/x.pem', '/etc/ssl/private/x.key');
 
-        return $body;
+        [, $body] = $renderer->render($strategy, $sites, $tls, $stack, CacheProfile::Production);
+
+        // An SNI plan is TWO files (the http-context vhosts and the main-context
+        // `stream {}` splitter). The security properties asserted here are
+        // properties of the PLAN, not of one half of it — proxy_protocol in
+        // particular is only correct when BOTH ends carry it — so the whole plan
+        // is what gets inspected.
+        $stream = $renderer->renderStream($strategy, $sites, reuseStream: false);
+
+        return $stream === null ? $body : $stream[1] . "\n" . $body;
     }
 
     // ── httpoxy (CVE-2016-5385) ───────────────────────────────────────────────

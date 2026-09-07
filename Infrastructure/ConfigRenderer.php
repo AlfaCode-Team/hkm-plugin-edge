@@ -22,6 +22,25 @@ use Plugins\Edge\Domain\TlsMode;
 final class ConfigRenderer
 {
     /**
+     * @param HostPaths $paths where THIS host keeps its logs and which nginx
+     *        dialect it speaks. The default is the Debian layout the templates
+     *        were written against, so constructing the renderer stays I/O-free;
+     *        `EdgeService` injects a DETECTED one for a real apply.
+     */
+    public function __construct(private readonly HostPaths $paths = new HostPaths()) {}
+
+    /**
+     * The same renderer, bound to a probed host instead of the default layout.
+     * The renderer holds no other state, so this is a plain rebind — it exists so
+     * the INJECTED renderer stays the one that renders (a `new ConfigRenderer()`
+     * here would silently make the constructor argument dead).
+     */
+    public function withHostPaths(HostPaths $paths): self
+    {
+        return new self($paths);
+    }
+
+    /**
      * @param list<Site> $sites
      * @return array{0: string, 1: string} [targetPath, contents] ('' path for None)
      */
@@ -32,17 +51,20 @@ final class ConfigRenderer
 
         return match ($strategy) {
             Strategy::NginxStream => [
-                (string) edge_config('paths.stream'),
-                // The stream splitter is a TLS SNI router by nature, so the
-                // internal nginx vhosts behind it always terminate TLS on the
-                // internal port — the chosen mode applies to the single-server
-                // strategies (nginx-only / apache-only), not the L4 splitter.
+                // HTTP-CONTEXT file: the internal backend vhosts ONLY.
                 //
-                // When an nginx stream splitter is ALREADY configured on the host,
-                // we reuse it and emit ONLY the internal backend vhosts, so we
-                // never write a second, conflicting `stream {}` block.
-                ($reuseStream ? $this->reuseStreamBanner() : $this->stream($sites) . "\n")
-                    . $this->nginxVhosts($sites, $tls->withMode(TlsMode::Ssl), $httpPort, $this->nginxInternalPort(), $stack, $profile, $this->usesProxyProtocol(true)),
+                // `stream {}` and `server {}` live in different nginx contexts —
+                // main and http — so a file holding both can be included nowhere:
+                // at main nginx rejects `server`, inside http it rejects `stream`.
+                // The splitter therefore has a file of its own (renderStream), and
+                // this one goes where every other vhost file goes.
+                //
+                // The splitter is a TLS SNI router by nature, so the vhosts behind
+                // it always terminate TLS on the internal port — the chosen mode
+                // applies to the single-server strategies, not the L4 splitter.
+                (string) edge_config('paths.nginx'),
+                $this->streamVhostBanner($reuseStream)
+                    . $this->nginxVhosts($sites, $tls->withMode(TlsMode::Ssl), $httpPort, $this->nginxInternalPort(), $stack, $profile, $this->usesProxyProtocol(true), header: false),
             ],
             Strategy::NginxOnly => [
                 (string) edge_config('paths.nginx'),
@@ -59,6 +81,27 @@ final class ConfigRenderer
             ],
             Strategy::None => ['', ''],
         };
+    }
+
+    /**
+     * The MAIN-context companion file: the `stream {}` SNI splitter itself, or
+     * null when this plan does not write one (any other strategy, or an existing
+     * splitter on the host that Edge merges into instead).
+     *
+     * It is a SEPARATE file because nginx contexts are not interchangeable: this
+     * one is included at the top level of nginx.conf, while the vhosts from
+     * render() are included inside `http {}`.
+     *
+     * @param list<Site> $sites
+     * @return array{0: string, 1: string}|null [targetPath, contents]
+     */
+    public function renderStream(Strategy $strategy, array $sites, bool $reuseStream = false): ?array
+    {
+        if ($strategy !== Strategy::NginxStream || $reuseStream) {
+            return null;
+        }
+
+        return [(string) edge_config('paths.stream'), $this->stream($sites)];
     }
 
     /**
@@ -79,18 +122,29 @@ final class ConfigRenderer
     }
 
     /**
-     * Header emitted instead of a fresh `stream {}` block when the host already
-     * has an nginx SNI splitter — records WHY no stream block is present here.
+     * The header of the vhost half of a split (SNI splitter) plan: says which
+     * context this file belongs in and where the splitter itself lives, because
+     * getting that wrong is the one mistake nginx will not start after.
      */
-    private function reuseStreamBanner(): string
+    private function streamVhostBanner(bool $reuseStream): string
     {
         $port = $this->nginxInternalPort();
 
-        return "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n"
-            . "# An existing nginx `stream {}` SNI splitter was detected on this host, so\n"
-            . "# Edge is REUSING it — no second stream block is written here. Only the\n"
-            . "# internal backend vhosts (TLS-terminating on :{$port}) are emitted below.\n"
-            . "# Point your existing splitter's nginx_backend upstream at 127.0.0.1:{$port}.\n\n";
+        $out = "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n"
+            . "# INCLUDE THIS FILE INSIDE `http { … }` — it holds `server` blocks.\n"
+            . "# These are the INTERNAL backends of an SNI stream splitter: they terminate\n"
+            . "# TLS on :{$port}, and the splitter forwards the platform's domains to them.\n";
+
+        $streamFile = (string) edge_config('paths.stream', '');
+
+        $out .= $reuseStream
+            ? "#\n# An existing nginx `stream {}` splitter was detected on this host, so Edge is\n"
+                . "# REUSING it — no splitter file is written. Point that splitter's\n"
+                . "# nginx_backend upstream at 127.0.0.1:{$port}.\n"
+            : "#\n# The splitter itself is a SEPARATE file — {$streamFile}\n"
+                . "# — and must be included at the nginx MAIN context, NOT here.\n";
+
+        return $out;
     }
 
     // ── nginx SNI stream splitter (L4) ────────────────────────────────────────
@@ -148,9 +202,11 @@ NGINX;
     // ── per-project nginx vhosts ──────────────────────────────────────────────
 
     /** @param list<Site> $sites */
-    private function nginxVhosts(array $sites, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile, bool $proxyProtocol = false): string
+    private function nginxVhosts(array $sites, TlsConfig $tls, int $httpPort, int $sslPort, ServerStack $stack, CacheProfile $profile, bool $proxyProtocol = false, bool $header = true): string
     {
-        $out = "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n";
+        // $header=false when the caller has already written a fuller one (the
+        // split SNI plan) — two "Managed by" lines in one file read as a bug.
+        $out = $header ? "# Managed by the HKM Edge plugin (`hkm edge:apply`). Do NOT edit by hand.\n" : '';
 
         // One map for the whole file — nginx rejects a duplicate map for the
         // same variable, so it cannot live in the per-site template.
@@ -223,16 +279,27 @@ NGINX;
         // back to the global log.
         $logs = '';
         if ((bool) edge_config('per_site_logs', true)) {
-            $preludeOn = (bool) edge_config('http_prelude.enabled', false);
-            $format    = (string) edge_config('http_prelude.log_format', 'cf_realip');
-            if ($preludeOn && $format !== '') {
-                $buffer = (string) edge_config('http_prelude.log_buffer', '32k');
-                $flush  = (string) edge_config('http_prelude.log_flush', '5s');
-                $logs = "    access_log /var/log/nginx/{$site->name}.access.log {$format} buffer={$buffer} flush={$flush};\n"
-                    . "    error_log  /var/log/nginx/{$site->name}.error.log {$errLevel};\n";
+            if (!$this->paths->hasNginxLogs()) {
+                // nginx REFUSES to start when an access_log directory is missing,
+                // so naming one we could not find would turn a cosmetic gap into
+                // a config that cannot load. Fall back to nginx's own global log
+                // and say why, in the file the operator is reading.
+                $logs = "    # Per-site logs omitted: no nginx log directory found on this host.\n"
+                    . "    # Set EDGE_NGINX_LOG_DIR to name one (this vhost logs to nginx's global log).\n";
             } else {
-                $logs = "    access_log /var/log/nginx/{$site->name}.access.log combined;\n"
-                    . "    error_log  /var/log/nginx/{$site->name}.error.log {$errLevel};\n";
+                $access    = $this->paths->nginxLog($site->name, 'access');
+                $error     = $this->paths->nginxLog($site->name, 'error');
+                $preludeOn = (bool) edge_config('http_prelude.enabled', false);
+                $format    = (string) edge_config('http_prelude.log_format', 'cf_realip');
+                if ($preludeOn && $format !== '') {
+                    $buffer = (string) edge_config('http_prelude.log_buffer', '32k');
+                    $flush  = (string) edge_config('http_prelude.log_flush', '5s');
+                    $logs = "    access_log {$access} {$format} buffer={$buffer} flush={$flush};\n"
+                        . "    error_log  {$error} {$errLevel};\n";
+                } else {
+                    $logs = "    access_log {$access} combined;\n"
+                        . "    error_log  {$error} {$errLevel};\n";
+                }
             }
         }
 
@@ -1171,11 +1238,44 @@ NGINX;
 
         // IPv4 + IPv6 listeners, mirroring the plain-HTTP redirect block so an
         // IPv6-only client that hits :80 has a :443 to be redirected to.
-        $listen = "listen {$sslPort} ssl{$pp};\n    listen [::]:{$sslPort} ssl{$pp};\n    http2 on;{$realIp}";
+        [$h2Listen, $h2Directive] = $this->http2();
+        $listen = "listen {$sslPort} ssl{$h2Listen}{$pp};\n    listen [::]:{$sslPort} ssl{$h2Listen}{$pp};{$h2Directive}{$realIp}";
         $ssl    = "\n    ssl_certificate     {$tls->cert};\n    ssl_certificate_key {$tls->key};\n"
             . $this->nginxTlsHardening();
 
         return [$listen, $ssl];
+    }
+
+    /**
+     * How HTTP/2 is spelled for the nginx that will actually load this file.
+     *
+     * `http2 on;` is a 1.25.1+ DIRECTIVE. On anything older it is an "unknown
+     * directive" and `nginx -t` fails outright — which is every current LTS
+     * (Ubuntu 22.04 → 1.18, Debian 12 → 1.22, RHEL 9 → 1.20). There, HTTP/2 is a
+     * `listen … ssl http2` parameter instead; that spelling still works on modern
+     * builds but logs a deprecation warning, so it is used only when the probed
+     * version says it is needed.
+     *
+     * EDGE_HTTP2 overrides the choice: `on` pins the directive, `listen` pins the
+     * legacy parameter, `off` drops HTTP/2 entirely.
+     *
+     * @return array{0: string, 1: string} [listen suffix, directive line]
+     */
+    private function http2(): array
+    {
+        $mode = strtolower(trim((string) (edge_config('http2', 'auto') ?: 'auto')));
+        $mode = match ($mode) {
+            'on', 'directive'    => 'directive',
+            'listen', 'legacy'   => 'listen',
+            'off', 'false', '0'  => 'off',
+            default              => $this->paths->supportsHttp2Directive() ? 'directive' : 'listen',
+        };
+
+        return match ($mode) {
+            'directive' => ['', "\n    http2 on;"],
+            'listen'    => [' http2', ''],
+            default     => ['', ''],
+        };
     }
 
     /**
@@ -1315,9 +1415,20 @@ NGINX;
         foreach (array_slice($site->publicDomains, 1) as $d) {
             $aliases .= "    ServerAlias {$d}\n";
         }
+        // SetEnv is mod_env. Every other optional directive in this file is gated
+        // on the module being loaded; this one was not, and an unknown directive
+        // is a HARD configtest failure — so the run-env the project needs to boot
+        // was also the thing that could stop the whole vhost from loading.
         $setenv = '';
-        foreach ($site->env as $k => $v) {
-            $setenv .= sprintf("    SetEnv %s \"%s\"\n", $k, $this->escapeApache($v));
+        if (!$stack->apacheHasModule('env')) {
+            if ($site->env !== []) {
+                $setenv = "    # Run-env NOT injected: mod_env is not loaded (a2enmod env).\n"
+                    . '    # ' . implode(', ', array_keys($site->env)) . " would have been set here.\n";
+            }
+        } else {
+            foreach ($site->env as $k => $v) {
+                $setenv .= sprintf("    SetEnv %s \"%s\"\n", $k, $this->escapeApache($v));
+            }
         }
 
         // PHP handler: FPM via mod_proxy_fcgi, or reverse-proxy for Swoole.
@@ -1347,7 +1458,7 @@ NGINX;
             : "\n    SSLEngine on\n    SSLCertificateFile    {$tls->cert}\n    SSLCertificateKeyFile {$tls->key}\n"
                 . $this->apacheTlsHardening($stack);
         $redirect = $tls->mode === TlsMode::Both
-            ? $this->apacheRedirect($site, $aliases, $httpPort) . "\n\n"
+            ? $this->apacheRedirect($site, $aliases, $httpPort, $stack) . "\n\n"
             : '';
 
         // HSTS on TLS modes (needs mod_headers) + compression (mod_brotli/
@@ -1437,15 +1548,33 @@ APACHE;
         }
         $protocols = (string) (edge_config('ssl_hardening.protocols') ?: 'TLSv1.2 TLSv1.3');
         // nginx writes "TLSv1.2 TLSv1.3"; Apache wants "-all +TLSv1.2 +TLSv1.3".
-        $apache = '-all';
+        //
+        // TLSv1.3 needs Apache 2.4.36+ built against OpenSSL 1.1.1+, and the
+        // version alone does not tell you — macOS ships a current 2.4.67 on
+        // LibreSSL, RHEL 7 and Ubuntu 18.04 on older OpenSSL. Naming a protocol
+        // the build does not know is "Illegal protocol", a HARD configtest
+        // failure that took the whole vhost down rather than weakening one
+        // setting. Where it is refused we drop the token and SAY so, so nobody
+        // reads the remaining line as a deliberate TLS 1.2-only policy.
+        $apache  = '-all';
+        $dropped = [];
         foreach (preg_split('/\s+/', trim($protocols)) ?: [] as $p) {
-            if (preg_match('#^TLSv1(\.[0-3])?$#', $p)) {
-                $apache .= ' +' . $p;
+            if (!preg_match('#^TLSv1(\.[0-3])?$#', $p)) {
+                continue;
             }
+            if ($p === 'TLSv1.3' && !$this->paths->apacheTls13) {
+                $dropped[] = $p;
+                continue;
+            }
+            $apache .= ' +' . $p;
         }
+        $note = $dropped === [] ? '' : "    # TLSv1.3 omitted: this Apache build's TLS library does not offer it
+"
+            . "    # (`SSLProtocol: Illegal protocol` would refuse the whole config).
+";
         $ciphers = (string) (edge_config('ssl_hardening.ciphers') ?: '');
 
-        $out = "    SSLProtocol {$apache}\n    SSLHonorCipherOrder off\n";
+        $out = $note . "    SSLProtocol {$apache}\n    SSLHonorCipherOrder off\n";
         if ($ciphers !== '' && preg_match('#^[A-Za-z0-9:+!_-]+$#', $ciphers)) {
             $out .= "    SSLCipherSuite {$ciphers}\n";
         }
@@ -1487,9 +1616,16 @@ APACHE;
         if (!(bool) edge_config('per_site_logs', true)) {
             return '';
         }
+        if (!$this->paths->hasApacheLogs()) {
+            // Same reasoning as the nginx side: `/var/log/apache2` is
+            // `/var/log/httpd` on RHEL, and naming a directory that is not there
+            // fails `apachectl configtest` outright.
+            return "\n    # Per-site logs omitted: no Apache log directory found on this host."
+                . "\n    # Set EDGE_APACHE_LOG_DIR to name one.";
+        }
 
-        return "\n    ErrorLog  /var/log/apache2/{$site->name}.error.log\n"
-            . "    CustomLog /var/log/apache2/{$site->name}.access.log combined";
+        return "\n    ErrorLog  " . $this->paths->apacheLog($site->name, 'error') . "\n"
+            . "    CustomLog " . $this->paths->apacheLog($site->name, 'access') . " combined";
     }
 
     /**
@@ -1611,15 +1747,31 @@ APACHE;
      * A plain-HTTP VirtualHost that rewrites every request to HTTPS (`both`).
      * $aliases is the pre-rendered "    ServerAlias …\n" block (may be '').
      */
-    private function apacheRedirect(Site $site, string $aliases, int $httpPort): string
+    private function apacheRedirect(Site $site, string $aliases, int $httpPort, ServerStack $stack): string
     {
         $primary = $site->publicDomains[0] ?? '_';
+
+        // mod_rewrite is NOT enabled by default on Debian/Ubuntu (`a2enmod
+        // rewrite`), and an unknown directive fails configtest outright — so the
+        // redirect degrades to mod_alias, and to nothing at all if that is
+        // missing too. `Redirect` cannot preserve the requested host across
+        // ServerAliases the way the rewrite does, hence the order.
+        if ($stack->apacheHasModule('rewrite')) {
+            $body = "    RewriteEngine On\n"
+                . "    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]";
+        } elseif ($stack->apacheHasModule('alias')) {
+            $body = "    # mod_rewrite is not loaded (a2enmod rewrite) — redirecting with\n"
+                . "    # mod_alias instead, which sends every alias to the primary host.\n"
+                . "    Redirect permanent / https://{$primary}/";
+        } else {
+            $body = "    # No HTTPS redirect: neither mod_rewrite nor mod_alias is loaded.\n"
+                . "    # Enable one (a2enmod rewrite) and re-run `hkm edge:apply`.";
+        }
 
         return rtrim(<<<APACHE
         <VirtualHost *:{$httpPort}>
             ServerName {$primary}
-        {$aliases}    RewriteEngine On
-            RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+        {$aliases}{$body}
         </VirtualHost>
         APACHE);
     }
