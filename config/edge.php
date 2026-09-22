@@ -557,6 +557,38 @@ return [
     ],
 
     /**
+     * 'app_paths'  EDGE_APP_PATHS   (comma-separated URI prefixes)
+     * default: none
+     *
+     * URI PREFIXES THE APPLICATION OWNS, whatever the URL ends in.
+     *
+     * The static-asset rule below matches on EXTENSION alone and resolves the
+     * file under the public root — a miss is a hard 404 that never reaches the
+     * app. That is right for `/build/app.a1b2c3.js` and wrong for a file the
+     * application SERVES: an app that streams a stored document at
+     * `/attachments/…/scan.png` never sees the request, and the browser gets a
+     * 404 for a file that exists.
+     *
+     * It is not a caching question, so raising a TTL or turning asset caching
+     * off does not fix it. The prefix has to be excluded from the rule.
+     *
+     * DO NOT SOLVE THIS BY SYMLINKING THE DIRECTORY UNDER THE PUBLIC ROOT.
+     * Files an application serves through a controller are usually served
+     * through one because who may read them is a decision — and a symlink hands
+     * every one of them to anybody who can guess the path, with nginx answering
+     * before a single line of the application runs.
+     *
+     *     EDGE_APP_PATHS=/attachments/,/invoices/
+     *
+     * Entries must start with `/`; `..` and anything outside
+     * `[A-Za-z0-9._/-]` is dropped rather than emitted.
+     */
+    'app_paths' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) (env('EDGE_APP_PATHS') ?: '')),
+    ))),
+
+    /**
      * 'deny_dirs'  EDGE_DENY_DIRS
      * default: vendor,node_modules,tests,.git,.github,bootstrap/cache
      *

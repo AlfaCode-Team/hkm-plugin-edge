@@ -13,6 +13,41 @@ not only that a PHP signature changed. Always preview an upgrade with:
 hkm cli -p <project> edge:apply --dry-run
 ```
 
+## [2.2.0] — 2026-09-22
+
+### Added — `EDGE_APP_PATHS`, for URLs the application serves
+
+The static-asset location matches on **extension alone** and resolves the file
+under the public root, answering `404` on a miss without the request ever
+reaching the application. That is correct for `/build/app.a1b2c3.js`. It is
+wrong for a file the application *serves*: a controller streaming a stored
+document at `/attachments/…/scan.png` is unreachable, because every URL it
+issues ends in an asset extension.
+
+The symptom is a broken image beside a record whose file is on disk and whose
+route is registered, with nothing in the application's log — no request arrived.
+Raising the asset TTL or turning asset caching off does not help; it was never
+a caching question.
+
+```bash
+EDGE_APP_PATHS=/attachments/,/invoices/
+```
+
+Declared prefixes are excluded from the asset rule, so they fall through to
+`location /` and reach the app on **both** runtimes. Entries must begin with
+`/`; `..`, a bare `/` and anything outside `[A-Za-z0-9._/-]` are dropped rather
+than emitted, because the value is interpolated into a regex and a junk entry
+would not be a wrong path but a different rule.
+
+**Declaring nothing renders exactly what it rendered before** — byte for byte —
+so `edge:apply` is a no-op diff for every project that does not set it.
+
+The alternative people reach for is symlinking the directory under the public
+root. Do not: files served through a controller are usually served through one
+because *who may read them* is a decision, and a symlink hands every one of them
+to anybody who can guess the path, with nginx answering before a line of the
+application runs.
+
 ## [2.1.1] — 2026-09-07
 
 ### Fixed — a test that contradicted the behaviour it was guarding

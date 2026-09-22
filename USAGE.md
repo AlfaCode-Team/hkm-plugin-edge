@@ -299,6 +299,7 @@ hkm cli -p shop edge:apply --production --all
 | `EDGE_CORS_ORIGINS` | — | allowlist origins (comma-separated), echoed back via a `$http_origin` map |
 | `EDGE_CORS_METHODS` / `EDGE_CORS_HEADERS` / `EDGE_CORS_CREDENTIALS` | *(sane)* / *(sane)* / `false` | CORS method/header allowlists + credentials |
 | `EDGE_ALLOWED_METHODS` | `GET\|HEAD\|POST\|PUT\|PATCH\|DELETE\|OPTIONS` | HTTP method guard (returns 405 otherwise); tighten to `GET\|HEAD\|POST` for form apps; empty disables |
+| `EDGE_APP_PATHS` | *(none)* | URI prefixes the APPLICATION serves, exempted from the static-asset rule. Without it a controller that streams a stored file at `/attachments/…/scan.png` is answered by nginx — the rule matches on extension alone, looks under the public root, and 404s a file that exists. Comma-separated, each starting with `/` (`/attachments/,/invoices/`). Prefer this over symlinking the directory into the public root, which serves those files to anyone who can guess the path, before any authorization runs |
 | `EDGE_DENY_DIRS` | `vendor,node_modules,tests,.git,.github,bootstrap/cache` | directories denied (prefix-matched, before the static rule). `storage` is deliberately excluded (public/storage upload symlink); add it where the app has none. Empty disables |
 | `EDGE_NGINX_DEBUG_LOG` | `false` | opt-in `error_log … debug` (needs nginx `--with-debug`; default level is `warn`) |
 | `EDGE_NGINX_STATUS` | `true` | emit `/nginx-status` on DEVELOPMENT hosts (never in production) |

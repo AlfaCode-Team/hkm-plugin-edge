@@ -363,7 +363,41 @@ NGINX;
         }
         // Static assets resolve ONLY under the public root; a miss is a hard 404
         // and is never forwarded to the application (same rule for both runtimes).
-        $static = "    location ~* \\.({$assetExt})\$ {\n"
+        //
+        // EXCEPT UNDER A PATH THE APPLICATION OWNS. The rule matches on the
+        // EXTENSION alone, so a controller that serves a stored file at
+        // `/attachments/…/scan.png` never sees the request: nginx looks for that
+        // file under the public root, does not find it, and answers 404 for a
+        // file that exists. Declared prefixes are excluded here, by negative
+        // lookahead, so they fall through to `location /` and reach the app.
+        //
+        // A LOOKAHEAD RATHER THAN `location ^~ /attachments/`, which is how the
+        // deny rules above win over this one. A prefix location would have to
+        // CARRY the front controller — the whole fastcgi block under PHP-FPM,
+        // the whole proxy block under OpenSwoole — copied per declared path and
+        // per runtime, and four copies of a proxy header set is four places for
+        // one of them to fall behind. Excluding the prefix changes nothing else:
+        // `location /` already sends everything it still matches to the app.
+        // DECLARING NOTHING RENDERS WHAT IT ALWAYS DID, byte for byte: the
+        // lookahead needs `.*` in front of the extension to have something to
+        // anchor to, and adding that to every project's config to buy nothing
+        // would be a diff on every site on the next `edge:apply`.
+        $appPaths = $this->appPaths();
+        $pattern  = "\\.({$assetExt})\$";
+        $notice   = '';
+
+        if ($appPaths !== []) {
+            $alts = implode('|', array_map(
+                static fn (string $path): string => str_replace(['.', '-'], ['\\.', '\\-'], $path),
+                $appPaths,
+            ));
+            $pattern = "^(?!(?:{$alts})).*" . $pattern;
+            $notice  = "    # Left to the application, not resolved on disk: "
+                . implode(' ', $appPaths) . "\n";
+        }
+
+        $static = $notice
+            . "    location ~* {$pattern} {\n"
             . $assetCache
             . "        try_files \$uri =404;\n    }";
 
@@ -747,6 +781,46 @@ NGINX;
      *
      * @return list<string>
      */
+    /**
+     * URI prefixes the application owns — excluded from the static-asset rule.
+     *
+     * SANITISED THE SAME WAY {@see denyDirs()} IS, and for a sharper reason:
+     * these strings are interpolated into an nginx REGEX, so a value carrying
+     * regex metacharacters would not merely describe the wrong path, it would
+     * change what the rule beside it matches. The charset admits `.`, `-` and
+     * `/` and nothing else; `.` and `-` are escaped on the way out, and every
+     * other character is refused rather than escaped, because a prefix that
+     * needs escaping is a prefix somebody has mistyped.
+     *
+     * @return list<string> normalised as `/prefix/`
+     */
+    private function appPaths(): array
+    {
+        $out = [];
+        foreach ((array) edge_config('app_paths', []) as $path) {
+            $path = trim((string) $path);
+            if ($path === '' || str_contains($path, '..')) {
+                continue;
+            }
+            if (!preg_match('#^/[A-Za-z0-9._/-]*$#', $path)) {
+                continue;
+            }
+            // A BARE `/` IS NOT A PREFIX, it is every URL — it would exclude the
+            // whole site from the static rule and turn every asset into an
+            // application request, silently. Whoever wrote it meant something
+            // else, so it is dropped rather than honoured.
+            if (trim($path, '/') === '') {
+                continue;
+            }
+            // Always a directory prefix: `/attachments` and `/attachments/` mean
+            // the same thing to whoever wrote it, and only one of them stops
+            // `/attachments-public/` being swept in with it.
+            $out[] = rtrim($path, '/') . '/';
+        }
+
+        return array_values(array_unique($out));
+    }
+
     private function denyDirs(): array
     {
         $list = edge_config('deny_dirs', null);
