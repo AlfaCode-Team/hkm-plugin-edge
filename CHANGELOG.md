@@ -13,6 +13,13 @@ not only that a PHP signature changed. Always preview an upgrade with:
 hkm cli -p <project> edge:apply --dry-run
 ```
 
+## [2.3.0] — 2026-10-16
+
+### Changed
+
+- Requires kernel `^1.19.0` (was `^1.13.1`). Every first-party plugin now
+  declares the current kernel release as its floor. No code changed.
+
 ## [2.2.0] — 2026-09-22
 
 ### Added — `EDGE_APP_PATHS`, for URLs the application serves
