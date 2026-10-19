@@ -353,7 +353,7 @@ hkm cli -p shop edge:apply --production --all
 
 | Env | Default | Purpose |
 |---|---|---|
-| `EDGE_COMPRESSION` | `auto` | `auto` \| `brotli` \| `gzip` \| `off` (resolved per server's capability) |
+| `EDGE_COMPRESSION` | `auto` | `auto` \| `brotli` \| `gzip` \| `off` (resolved per server's capability). On nginx, any mode but `off` also emits `gzip_static on;` when nginx was built with `http_gzip_static_module`, so prebuilt `.gz` files (Vite) are served without recompression; Apache is unchanged |
 | `EDGE_CACHE_ASSETS` / `EDGE_CACHE_ASSETS_TTL` | `true` / `31536000` | cache fingerprinted static assets (prod), TTL seconds |
 | `EDGE_CACHE_HTML` | `false` | cache HTML/dynamic responses (almost always off) |
 | `EDGE_HTTP_PRELUDE` | `false` | emit `log_format` + rate-limit zones + Cloudflare real-IP once at file top |

@@ -1,6 +1,6 @@
 {
     "name": "edge",
-    "version": "2.3.0",
+    "version": "2.4.0",
     "kernel": "^1.19.0",
     "solves": "edge.routing",
     "type": "module",

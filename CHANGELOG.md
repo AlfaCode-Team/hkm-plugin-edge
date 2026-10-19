@@ -13,6 +13,17 @@ not only that a PHP signature changed. Always preview an upgrade with:
 hkm cli -p <project> edge:apply --dry-run
 ```
 
+## [2.4.0] — 2026-10-20
+
+### Added
+
+- nginx: `gzip_static on;` is emitted with the compression block (gzip and
+  brotli modes, never `EDGE_COMPRESSION=off`), so the `.gz` siblings Vite
+  builds are served as they are instead of being recompressed on every request.
+  Only emitted when `nginx -V` lists `--with-http_gzip_static_module`
+  (`ServerStack::$nginxHasGzipStatic`). Files without a `.gz` sibling still fall
+  back to on-the-fly gzip. Apache is unchanged. Preview with `edge:apply --dry-run`.
+
 ## [2.3.0] — 2026-10-16
 
 ### Changed

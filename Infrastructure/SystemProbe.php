@@ -47,6 +47,7 @@ final class SystemProbe
             apacheActive:    $probeApache && ($this->active('apache2') || $this->active('httpd')),
             nginxHasBrotli:  $nginxInstalled && $this->nginxHasBrotli(),
             apacheModules:   $apacheInstalled ? $this->apacheModules() : [],
+            nginxHasGzipStatic: $nginxInstalled && str_contains($this->nginxBanner(), 'http_gzip_static_module'),
             nginxHasStreamConfig: $nginxInstalled && $this->nginxStreamConfigExists((string) edge_config('paths.stream', '')),
         );
     }

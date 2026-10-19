@@ -1934,9 +1934,16 @@ APACHE;
             . "    gzip_proxied any;\n    gzip_comp_level 6;\n    gzip_types {$types};\n";
         $brotli = "    brotli on;\n    brotli_comp_level 6;\n    brotli_min_length 256;\n    brotli_types {$types};\n";
 
+        // Serve a prebuilt `<file>.gz` sibling (Vite ships one per JS/CSS file)
+        // instead of recompressing it per request. Server level: the asset
+        // location sets no gzip_static of its own, so it inherits this. A file
+        // with no sibling still falls back to on-the-fly gzip. Gated on the
+        // module being compiled in; ngx_brotli's brotli_static is not emitted.
+        $static = $stack->nginxHasGzipStatic ? "    gzip_static on;\n" : '';
+
         return match ($this->compressionMode($stack->nginxHasBrotli)) {
-            'brotli' => $brotli . $gzip, // gzip fallback for clients without `br`
-            'gzip'   => $gzip,
+            'brotli' => $brotli . $gzip . $static, // gzip fallback for clients without `br`
+            'gzip'   => $gzip . $static,
             default  => '',             // 'off' → nothing
         };
     }

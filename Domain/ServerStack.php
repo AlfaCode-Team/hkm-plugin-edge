@@ -29,6 +29,10 @@ final readonly class ServerStack
         // block using ssl_preread) in a file Edge does not manage. When true Edge
         // reuses it instead of emitting a second, conflicting splitter.
         public bool $nginxHasStreamConfig = false,
+        // Built with ngx_http_gzip_static_module (`--with-http_gzip_static_module`).
+        // Unknown/false → `gzip_static` is not emitted, since nginx refuses to
+        // start on a directive its build does not know.
+        public bool $nginxHasGzipStatic = false,
     ) {}
 
     /**
